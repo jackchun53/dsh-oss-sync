@@ -26,23 +26,69 @@ through `ctx.credentials`, and `agent-default-model`, `llm-pi-ai`, and
 
 ## Install
 
-```sh
-# from the directory containing this checkout
-dsh plugin --profile web add ./dsh-oss-sync
-dsh --profile web
-```
-
-The profile forwards to pnpm, so `remove`, `update`, and the rest of the pnpm
-verbs work. `dsh plugin` also accepts a git spec or a packed tarball, which
-needs the package's `lib/` to be built first:
+One script installs into the CLI profiles this machine boots, and prints the
+Desktop application's steps rather than touching its profile:
 
 ```sh
-pnpm install && pnpm build
+pnpm install && pnpm build          # from this checkout
+node scripts/install.mjs --profile web --desktop
 ```
 
-`@deepseek-ai/*` packages are peer dependencies and resolve to the running
-installation, so the plugin shares one Cordis instance with the host. Only
-`@aws-sdk/client-s3` and `yaml` are installed beside it.
+```
+  --profile <name>   CLI profile to install into; repeatable (default: web)
+  --spec <spec>      package spec; defaults to this checkout's git remote
+  --dsh <command>    how to invoke dsh; detected from PATH, then a sibling checkout
+  --desktop          print the Desktop install steps
+  --check            verify the composed layers without changing anything
+  --dry-run          print every command without running it
+```
+
+It installs by spec — this checkout's git remote by default — so a machine
+that only runs dsh needs neither this directory nor the toolchain. `lib/` is
+committed, so the package arrives built and no install script runs.
+
+### Web and other CLI profiles
+
+The script runs `dsh plugin --profile <name> add <spec>`, which forwards to
+pnpm inside `$DSH_HOME/profiles/<name>` and appends the bundle to the profile's
+layer list. It then composes the profile with `--dump-config` and checks that
+`dsh-oss-sync/settings` and `dsh-oss-sync/credentials` are the rows in force,
+which is what proves the patch applied — a package can install without its
+layer being composed.
+
+A profile the harness does not ship (`--profile mine`) initializes with
+`@deepseek-ai/dsh-base` alone, so it has no Web UI; `web` is what the script
+defaults to for that reason.
+
+### Desktop
+
+`dsh` refuses `--profile desktop` outright:
+
+```
+error: profile "desktop" is managed exclusively by the Electron application
+```
+
+Electron owns that directory and installs plugins through its own plugin
+window. Install the same spec there — `github:jackchun53/dsh-oss-sync` — and nothing
+else is required: the committed `lib/` means no dependency lifecycle script,
+so the reviewed-build approval that script-bearing packages need does not
+apply. Desktop links the bundled first-party packages into the profile, so the
+`@deepseek-ai/*` peers resolve to the application's own copies, exactly as they
+do for a CLI profile.
+
+Desktop and CLI share `$DSH_HOME`, so both surfaces read the same two synced
+documents and the same offline cache.
+
+### Then set the environment
+
+The providers read their bucket from the launch environment on every surface:
+
+| Variable | Meaning |
+|---|---|
+| `DSH_SYNC_BUCKET` | Bucket holding the documents. Required. |
+| `DSH_SYNC_ENDPOINT` | S3-compatible endpoint; omit for AWS. |
+| `DSH_SYNC_REGION`, `DSH_SYNC_PREFIX`, `DSH_SYNC_POLL_MS` | Region, key prefix, poll interval. |
+| `DSH_SYNC_ACCESS_KEY_ID` / `DSH_SYNC_SECRET_ACCESS_KEY` | Static credentials; unset falls back to the SDK chain. |
 
 ## Configure
 

@@ -24,7 +24,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "clean": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\""
+    "clean": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\"",
+    "install:profiles": "node scripts/install.mjs",
+    "smoke": "node test/smoke.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1131.0",
