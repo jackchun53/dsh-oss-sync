@@ -69,12 +69,30 @@ error: profile "desktop" is managed exclusively by the Electron application
 ```
 
 Electron owns that directory and installs plugins through its own plugin
-window. Install the same spec there — `github:jackchun53/dsh-oss-sync` — and nothing
-else is required: the committed `lib/` means no dependency lifecycle script,
-so the reviewed-build approval that script-bearing packages need does not
-apply. Desktop links the bundled first-party packages into the profile, so the
-`@deepseek-ai/*` peers resolve to the application's own copies, exactly as they
-do for a CLI profile.
+window, and **that window accepts only npm registry package specs**: it
+validates the spec with `packageNameFromSpec`, which rejects anything carrying
+a URL scheme or `file:`, then runs `pnpm add <spec> --save-exact
+--ignore-scripts` inside the profile. A `github:` or local-path spec that works
+for a CLI profile therefore cannot be installed from Desktop at all.
+
+So Desktop needs this package published:
+
+```sh
+npm login          # or: pnpm publish --access public
+pnpm publish
+```
+
+Then install `dsh-oss-sync` (pin the version if the window asks for one) from
+the plugin window. Three properties make it fit Desktop's validation:
+
+- `@deepseek-ai/*` are `peerDependencies`, which is what Desktop requires of
+  host-owned packages, and their `*` ranges satisfy whatever the application
+  bundles.
+- Its ordinary dependencies (`@aws-sdk/client-s3`,
+  `@aws-sdk/credential-provider-node`, `yaml`) resolve inside the profile and
+  ship no install scripts, so the reviewed-build list does not need an entry.
+- `--ignore-scripts` means nothing builds on install, which is why `lib/` and
+  `lib/client.js` are committed and the published tarball carries them.
 
 Desktop and CLI share `$DSH_HOME`, so both surfaces read the same two synced
 documents and the same offline cache.

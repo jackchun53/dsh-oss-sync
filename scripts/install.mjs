@@ -174,7 +174,10 @@ function run(launcher, args, options) {
  */
 function verify(launcher, profile, options) {
   const dump = run(launcher, ['--profile', profile, '--dump-config'], { ...options, capture: true })
-  return dump.includes(`${PACKAGE_NAME}/settings`) && dump.includes(`${PACKAGE_NAME}/credentials`)
+  // The settings row is named by the bare package specifier (the browser module
+  // scan needs that); only the credentials row carries a subpath.
+  return dump.includes(`name: ${PACKAGE_NAME}
+`) && dump.includes(`${PACKAGE_NAME}/credentials`)
 }
 
 /** Report the environment the providers read. */

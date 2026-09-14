@@ -1,0 +1,17 @@
+{
+  "name": "dsh-profile-web",
+  "private": true,
+  "dependencies": {
+    "dsh-oss-sync": "file:E:/workspace/nodejs/dsh-oss-sync/dsh-oss-sync-0.1.0.tgz"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-oss-sync"
+      ],
+      "patchReload": "live"
+    }
+  }
+}
