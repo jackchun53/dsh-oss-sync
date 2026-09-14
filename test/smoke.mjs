@@ -36,6 +36,20 @@ function machineConfig(stateDir, prefix = 'dsh-sync') {
 
 const Schema = z.object({ value: z.number().default(0) })
 
+/**
+ * Wait until a condition holds. Watcher invocations run asynchronously after
+ * the commit that triggered them, so a provider's reaction to a settings write
+ * is never observable on the line that performed it.
+ */
+async function waitFor(condition, label) {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    if (condition()) return
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`timed out waiting for ${label}`)
+}
+
 async function boot(Plugin, config) {
   const ctx = new Context()
   const fiber = ctx.plugin(Plugin, config)
@@ -71,13 +85,14 @@ try {
 
   // A write presenting a stale ETag must be refused, not applied.
   const store = new ObjectStore(resolveConfig(machineConfig(machineA)))
-  const current = await store.read('dsh-sync/settings.yaml')
-  await store.write('dsh-sync/settings.yaml', 'other\n', { ifMatch: current.etag })
+  await store.write('dsh-sync/probe.yaml', 'first\n', { ifNoneMatch: true })
+  const current = await store.read('dsh-sync/probe.yaml')
+  await store.write('dsh-sync/probe.yaml', 'second\n', { ifMatch: current.etag })
   await assert.rejects(
-    () => store.write('dsh-sync/settings.yaml', 'stale\n', { ifMatch: current.etag }),
+    () => store.write('dsh-sync/probe.yaml', 'stale\n', { ifMatch: current.etag }),
     error => error instanceof PreconditionFailedError,
   )
-  assert.equal(service.objects.get('dsh-sync/settings.yaml'), 'other\n', 'the refused write changed nothing')
+  assert.equal(service.objects.get('dsh-sync/probe.yaml'), 'second\n', 'the refused write changed nothing')
   store.destroy()
   console.log('ok  settings: a stale revision is refused with PreconditionFailedError')
 
@@ -129,6 +144,44 @@ try {
   await credentialsService.deleteRecord(key)
   assert.deepEqual(await credentialsService.readRecord(key), undefined)
   console.log('ok  credentials: values, environment shadowing, and record lifecycle')
+
+  // ── the maintenance namespace: settings, status, and the request token ────
+  const panel = await boot(OssSettingsProvider, machineConfig(join(root, 'panel')))
+  cleanups.push(() => panel.fiber.dispose())
+  const panelSchema = panel.ctx.settings.register('panel-probe', Schema)
+  await panelSchema.update({ value: 7 })
+
+  const namespace = panel.ctx.settings.get('oss-sync')
+  assert.equal(namespace.bucket, 'test', 'the namespace carries the entry config as its base layer')
+  const descriptor = panel.ctx.settings.describe().find(entry => String(entry.ns) === 'oss-sync')
+  assert.ok(descriptor, 'the namespace is served to the settings page')
+  assert.equal(descriptor.value.status.settings.objectKey, 'dsh-sync/settings.yaml',
+    'the provider published its status into the namespace')
+  assert.ok(descriptor.value.status.settings.deviceId.length > 0, 'the status names this machine')
+  console.log('ok  panel: the sync namespace exposes configuration and live status')
+
+  // A connection parameter written from the page moves the documents and
+  // carries the configuration with them.
+  await panel.ctx.settings.update('oss-sync', { prefix: 'moved' })
+  await waitFor(() => service.objects.has('moved/settings.yaml'), 'the document to move')
+  const moved = service.objects.get('moved/settings.yaml')
+  assert.ok(moved, 'the document moved to the prefix the page asked for')
+  assert.match(moved, /panel-probe:/u, 'the move carried the configuration instead of losing it')
+  assert.match(moved, /oss-sync:/u, 'the connection parameters are stored as configuration')
+  assert.ok(!/status:/u.test(moved), 'the runtime status never reaches the bucket')
+  assert.ok(!/request:/u.test(moved), 'a sync request never reaches the bucket')
+  console.log('ok  panel: editing the connection moves both documents and keeps runtime facts out')
+
+  // A request token runs a sync; the poll would take a full interval otherwise.
+  const before = panel.ctx.settings.get('oss-sync').status.settings.lastReadAt
+  await panel.ctx.settings.update('oss-sync', { request: 'r1' })
+  await waitFor(
+    () => panel.ctx.settings.get('oss-sync').status.settings.lastReadAt !== before,
+    'the request token to run a sync',
+  )
+  const after = panel.ctx.settings.get('oss-sync').status.settings.lastReadAt
+  assert.notEqual(after, before, 'the request token ran a sync')
+  console.log('ok  panel: the request token triggers a sync on demand')
 
   // ── another machine's write reaches this one through the poll ────────────
   const observer = await boot(OssCredentialProvider, { ...machineConfig(join(root, 'creds-b')), pollMs: 1000 })

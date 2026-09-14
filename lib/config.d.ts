@@ -3,10 +3,15 @@
  * providers: which bucket holds the synced documents, how to authenticate,
  * and how often to look for another machine's committed writes.
  *
+ * Two layers feed the resolved parameters. The entry config is the bootstrap —
+ * it is what a cold start needs before anything has been read — and the
+ * `oss-sync` settings namespace overrides it once the document is in hand, so
+ * the settings page can change the connection without editing cordis.yml.
+ *
  * @module dsh-oss-sync/config
  */
 import z from '@deepseek-ai/schemastery';
-/** Plugin config accepted by both provider entries. */
+/** Entry config: the bootstrap values a cold start needs. */
 export interface Config {
     /** Bucket holding the synced documents. */
     bucket: string;
@@ -29,6 +34,17 @@ export interface Config {
 }
 /** Schemastery schema for {@link Config}; the loader validates entry config against it. */
 export declare const ConfigSchema: z<Config>;
+/** Connection parameters a settings namespace may override. */
+export interface SpecOverrides {
+    bucket?: string;
+    endpoint?: string;
+    region?: string;
+    prefix?: string;
+    forcePathStyle?: boolean;
+    accessKeyIdEnv?: string;
+    secretAccessKeyEnv?: string;
+    pollMs?: number;
+}
 /** Every parameter with its default applied; programmatic construction bypasses the schema. */
 export interface ResolvedConfig {
     bucket: string;
@@ -47,9 +63,23 @@ export interface ResolvedConfig {
  */
 export declare function resolveDshHome(): string;
 /**
- * Resolve entry config into every parameter the providers act on, so
+ * Resolve the entry config into the parameters a cold start runs on, so
  * defaulting happens in one explicit step rather than inline at each use.
  * @param config - raw entry config.
  * @returns the resolved parameters.
  */
 export declare function resolveConfig(config: Config): ResolvedConfig;
+/**
+ * Fold the settings namespace over the bootstrap parameters.
+ * @param base - parameters resolved from the entry config.
+ * @param overrides - the effective `oss-sync` namespace value.
+ * @returns the parameters the providers act on now.
+ */
+export declare function applyOverrides(base: ResolvedConfig, overrides: SpecOverrides | undefined): ResolvedConfig;
+/**
+ * Whether two resolved parameters address the same storage the same way.
+ * @param left - one parameter set.
+ * @param right - the other parameter set.
+ * @returns whether a rebuild would reach the same object with the same signature.
+ */
+export declare function sameConnection(left: ResolvedConfig, right: ResolvedConfig): boolean;

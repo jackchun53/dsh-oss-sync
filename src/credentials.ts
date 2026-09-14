@@ -21,7 +21,10 @@ import {
   type CredentialRecordInfo, type CredentialRef, type ResolvedCredential,
 } from '@deepseek-ai/dsh-credentials'
 import z from '@deepseek-ai/schemastery'
-import { ConfigSchema, resolveConfig, type Config } from './config.js'
+import {
+  ConfigSchema, applyOverrides, resolveConfig, sameConnection, type Config, type ResolvedConfig,
+} from './config.js'
+import { SYNC_NAMESPACE, type SyncControl, type SyncSettings, type SyncStatus } from './control.js'
 import { ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope } from './envelope.js'
 import { PollLoop } from './poll.js'
 import { ObjectStore, PreconditionFailedError } from './store.js'
@@ -37,6 +40,9 @@ const ENV_SOURCE = 'env'
 
 /** The source-layer id a value from the bucket reports. */
 const STORE_SOURCE = 'oss'
+
+/** This provider's key in the sync namespace's status map. */
+const STATUS_LABEL = 'credentials'
 
 /** Both halves of the seam as stored in one object. */
 interface CredentialDocument {
@@ -81,10 +87,16 @@ function asDocument(value: unknown): CredentialDocument {
 export class OssCredentialProvider extends CredentialProvider {
   static Config: z<Config> = ConfigSchema
 
-  private readonly store: ObjectStore
+  /** Parameters the entry config supplies; the namespace overrides them. */
+  private readonly bootstrap: ResolvedConfig
   private readonly state: SyncState
-  private readonly key: string
+  /** Parameters in force now. */
+  private spec: ResolvedConfig
+  private store: ObjectStore
+  private key: string
   private readonly poll: PollLoop
+  /** Coordination handle, present once the settings half has provided it. */
+  private control: SyncControl | undefined
   /** The document this process considers current. */
   private local: CredentialDocument = emptyDocument()
   /** ETag of the revision {@link local} reflects; `undefined` until one is read. */
@@ -98,11 +110,12 @@ export class OssCredentialProvider extends CredentialProvider {
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
-    const resolved = resolveConfig(config)
-    this.store = new ObjectStore(resolved)
-    this.state = new SyncState(resolved.stateDir)
-    this.key = `${resolved.prefix}/${OBJECT_NAME}`
-    this.poll = new PollLoop(resolved.pollMs, () => this.refresh(), (error: unknown) => {
+    this.bootstrap = resolveConfig(config)
+    this.spec = this.bootstrap
+    this.store = new ObjectStore(this.spec)
+    this.state = new SyncState(this.spec.stateDir)
+    this.key = `${this.spec.prefix}/${OBJECT_NAME}`
+    this.poll = new PollLoop(this.spec.pollMs, () => this.refresh(), (error: unknown) => {
       this.ctx.logger.error('dsh-oss-sync: credential poll failed at %s', this.key)
       this.ctx.logger.error(error)
     })
@@ -274,6 +287,22 @@ export class OssCredentialProvider extends CredentialProvider {
   async* [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void> {
     await this.store.preflight()
     this.local = await this.load()
+    // The settings half owns the sync namespace and provides the handle both
+    // providers refresh through, so one card action refreshes the settings
+    // document and the credential document together.
+    this.ctx.inject(['ossSyncControl'], (controlCtx) => {
+      this.control = controlCtx.ossSyncControl
+      return this.control.join(STATUS_LABEL, { refresh: () => this.refresh() })
+    })
+    // The namespace overrides the bootstrap parameters, so a page edit reaches
+    // this provider without a restart.
+    this.ctx.inject(['settings'], () => {
+      void this.reconcile().catch((error: unknown) => {
+        this.ctx.logger.error('dsh-oss-sync: could not apply the sync settings to credentials')
+        this.ctx.logger.error(error)
+      })
+    })
+    await this.reconcile()
     this.poll.start()
     yield async () => {
       this.closed = true
@@ -281,6 +310,84 @@ export class OssCredentialProvider extends CredentialProvider {
       await this.operations
       this.store.destroy()
     }
+  }
+
+  /** The `oss-sync` namespace value, when the settings half serves it. */
+  private settings(): SyncSettings | undefined {
+    return this.ctx.get('settings')?.get(SYNC_NAMESPACE) as SyncSettings | undefined
+  }
+
+  /**
+   * Adopt the parameters the namespace resolves to. A poll interval applies
+   * immediately; a changed connection or prefix moves this provider to the
+   * new location, carrying the document it holds when the target is empty.
+   */
+  private async reconcile(): Promise<void> {
+    const desired = applyOverrides(this.bootstrap, this.settings())
+    if (desired.pollMs !== this.spec.pollMs) this.poll.restart(desired.pollMs)
+    if (sameConnection(desired, this.spec) && desired.prefix === this.spec.prefix) {
+      this.spec = desired
+      return
+    }
+    return this.relocate(desired)
+  }
+
+  /** Move this provider's document home to the parameters the page asked for. */
+  private relocate(desired: ResolvedConfig): Promise<void> {
+    return this.enqueue(async () => {
+      const carried = this.local
+      const connectionChanged = !sameConnection(desired, this.spec)
+      this.spec = desired
+      this.key = `${desired.prefix}/${OBJECT_NAME}`
+      if (connectionChanged) {
+        this.store.destroy()
+        this.store = new ObjectStore(desired)
+        await this.store.preflight()
+      }
+      // The target starts from nothing: read it, and seed it from the document
+      // already in hand when it is empty, so changing the connection carries
+      // the stored credentials instead of appearing to lose them.
+      this.etag = undefined
+      let remote
+      try {
+        remote = await this.store.read(this.key)
+      } catch (error) {
+        this.report({ state: 'error', lastError: String(error), objectKey: this.key })
+        throw error
+      }
+      if (remote === undefined) {
+        const envelope: Envelope<CredentialDocument> = {
+          v: ENVELOPE_VERSION,
+          rev: this.revision + 1,
+          writer: await this.state.deviceId(),
+          updatedAt: new Date().toISOString(),
+          doc: carried,
+        }
+        const written = await this.store.write(this.key, encodeEnvelope(envelope), { ifNoneMatch: true })
+        this.etag = written.etag
+        this.revision = envelope.rev
+        await this.state.writeCache(OBJECT_NAME, envelope)
+        this.local = carried
+        this.ctx.logger.info('dsh-oss-sync: credentials moved to %s and seeded it from this machine', this.key)
+        return
+      }
+      const envelope = parseEnvelope<CredentialDocument>(remote.text)
+      this.etag = remote.etag
+      this.revision = envelope.rev
+      this.local = asDocument(envelope.doc)
+      await this.state.writeCache(OBJECT_NAME, envelope)
+      this.ctx.logger.info('dsh-oss-sync: credentials moved to %s and adopted revision %d', this.key, envelope.rev)
+    })
+  }
+
+  /** Merge this provider's status into the published sync namespace. */
+  private report(patch: Partial<SyncStatus>): void {
+    this.control?.report(STATUS_LABEL, {
+      objectKey: this.key,
+      revision: this.revision,
+      state: 'idle',
+      ...patch,
+    })
   }
 
   /**
@@ -326,9 +433,11 @@ export class OssCredentialProvider extends CredentialProvider {
         this.revision = envelope.rev
         this.local = next
         await this.state.writeCache(OBJECT_NAME, envelope)
+        this.report({ state: 'idle', revision: envelope.rev, lastWriteAt: envelope.updatedAt, lastError: undefined })
         return { doc: next, written: true }
       } catch (error) {
         if (error instanceof PreconditionFailedError && attempt < MAX_WRITE_ATTEMPTS) continue
+        this.report({ state: 'error', lastError: String(error) })
         throw error
       }
     }
@@ -339,16 +448,21 @@ export class OssCredentialProvider extends CredentialProvider {
   private refresh(): Promise<void> {
     return this.enqueue(async () => {
       if (this.closed) return
+      await this.reconcile()
       let remote
       try {
         remote = await this.store.read(this.key)
       } catch (error) {
         this.ctx.logger.warn('dsh-oss-sync: could not read %s; keeping the last good document', this.key)
         this.ctx.logger.warn(error)
+        this.report({ state: 'error', lastError: String(error) })
         return
       }
       if (remote === undefined) return
-      if (this.etag !== undefined && remote.etag === this.etag) return
+      if (this.etag !== undefined && remote.etag === this.etag) {
+        this.report({ state: 'idle', lastReadAt: new Date().toISOString(), lastError: undefined })
+        return
+      }
       const envelope = parseEnvelope<CredentialDocument>(remote.text)
       if (envelope.writer === await this.state.deviceId() && envelope.rev === this.revision) return
       const previous = this.local
@@ -357,6 +471,14 @@ export class OssCredentialProvider extends CredentialProvider {
       this.revision = envelope.rev
       this.local = next
       await this.state.writeCache(OBJECT_NAME, { ...envelope, doc: next })
+      this.report({
+        state: 'idle',
+        revision: envelope.rev,
+        writer: envelope.writer,
+        updatedAt: envelope.updatedAt,
+        lastReadAt: new Date().toISOString(),
+        lastError: undefined,
+      })
       this.ctx.logger.info('dsh-oss-sync: applying credential revision %d from %s', envelope.rev, envelope.writer)
       for (const ref of new Set([...Object.keys(previous.refs), ...Object.keys(next.refs)])) {
         if (previous.refs[ref] !== next.refs[ref]) this.notifyUpdated(ref as CredentialRef)

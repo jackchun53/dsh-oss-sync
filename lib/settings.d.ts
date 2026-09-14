@@ -7,6 +7,10 @@
  * overwrite each other silently; a poll publishes another machine's committed
  * revision into the seam, which re-resolves every registered namespace.
  *
+ * This provider also owns the `oss-sync` namespace, which is how the settings
+ * page reads and drives the sync: the editable connection parameters, the
+ * runtime status both providers report, and the request token a card writes.
+ *
  * @module dsh-oss-sync/settings
  */
 import type { Context } from '@deepseek-ai/cordis';
@@ -26,10 +30,20 @@ import { type Config } from './config.js';
  */
 export declare class OssSettingsProvider extends SettingsProvider {
     static Config: z<Config>;
-    private readonly store;
+    /** Parameters the entry config supplies; the namespace overrides them. */
+    private readonly bootstrap;
     private readonly state;
-    private readonly key;
+    /** Parameters in force now. */
+    private spec;
+    private store;
+    private key;
     private readonly poll;
+    private scope;
+    /** Last request token this provider acted on. */
+    private handled;
+    /** Status each participant last reported. */
+    private readonly status;
+    private readonly participants;
     /**
      * The document this process considers current. It is what the seam holds
      * and what a deferred publish republishes, so a publish can never resurrect
@@ -65,6 +79,30 @@ export declare class OssSettingsProvider extends SettingsProvider {
      */
     protected persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void>;
     [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void>;
+    /** The coordination handle the credentials provider joins. */
+    private createControl;
+    /**
+     * React to a committed `oss-sync` section: run a requested sync, then adopt
+     * any connection parameter the user changed.
+     */
+    private onSettings;
+    /** Run this provider's and every participant's refresh, as one card gesture. */
+    private runRequested;
+    /**
+     * Adopt the parameters the namespace now resolves to. A poll interval
+     * applies immediately; a changed connection or prefix moves the providers
+     * to the new location, carrying the document this process holds when the
+     * target is empty.
+     */
+    private reconcile;
+    /** Move both documents' home to the parameters the settings page asked for. */
+    private relocate;
+    /** Adopt one stored revision as this process's document. */
+    private adopt;
+    /** Publish the seam's document with the runtime status merged in. */
+    private publishDocument;
+    /** Merge one participant's status and republish the namespace. */
+    private report;
     /** Read storage once and publish a revision this process did not commit. */
     private refresh;
     /** Queue one exclusive operation behind every earlier one. */

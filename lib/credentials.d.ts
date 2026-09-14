@@ -29,10 +29,16 @@ import { type Config } from './config.js';
  */
 export declare class OssCredentialProvider extends CredentialProvider {
     static Config: z<Config>;
-    private readonly store;
+    /** Parameters the entry config supplies; the namespace overrides them. */
+    private readonly bootstrap;
     private readonly state;
-    private readonly key;
+    /** Parameters in force now. */
+    private spec;
+    private store;
+    private key;
     private readonly poll;
+    /** Coordination handle, present once the settings half has provided it. */
+    private control;
     /** The document this process considers current. */
     private local;
     /** ETag of the revision {@link local} reflects; `undefined` until one is read. */
@@ -107,6 +113,18 @@ export declare class OssCredentialProvider extends CredentialProvider {
      */
     private load;
     [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void>;
+    /** The `oss-sync` namespace value, when the settings half serves it. */
+    private settings;
+    /**
+     * Adopt the parameters the namespace resolves to. A poll interval applies
+     * immediately; a changed connection or prefix moves this provider to the
+     * new location, carrying the document it holds when the target is empty.
+     */
+    private reconcile;
+    /** Move this provider's document home to the parameters the page asked for. */
+    private relocate;
+    /** Merge this provider's status into the published sync namespace. */
+    private report;
     /**
      * Apply one edit to the stored document and commit it under the ETag of the
      * revision the edit saw, retrying against a newer revision when another

@@ -76,6 +76,27 @@ The bucket must support `If-Match` and `If-None-Match` on `PutObject`.
 Governance-mode bucket versioning is strongly recommended: it is what turns a
 mistaken overwrite into a recoverable revision.
 
+## The `oss-sync` namespace
+
+The settings page reads and drives the sync through one registered settings
+namespace, because the seam already carries live values to the browser: a
+namespace re-resolves on every commit and the client mirror forwards it. No
+second channel was needed.
+
+| Field | Meaning |
+|---|---|
+| `bucket`, `endpoint`, `region`, `forcePathStyle`, `accessKeyIdEnv`, `secretAccessKeyEnv` | Connection parameters; the entry config is the base layer, so an unset field keeps what `cordis.yml` and the environment supply. |
+| `prefix` | Key prefix. Changing it moves both documents and seeds the new location from the document this machine holds. |
+| `pollMs` | Poll interval; applies immediately. |
+| `status` | Runtime, read-only. Per provider (`settings`, `credentials`): revision, writer, commit time, device id, object key, last read/write, last error. |
+| `request` | Write any new value to run a sync now, on both providers, without waiting for the interval. |
+
+`status` and `request` are stripped before anything reaches the bucket, so the
+stored document holds configuration only. Changing the connection parameters
+rebuilds the client and re-reads the new location at once; the cache under
+`$DSH_HOME/.dsh-oss-sync/` is what makes that safe when the new location is
+unreachable or empty.
+
 ## What lands in the bucket
 
 Two objects, `<prefix>/settings.yaml` and `<prefix>/credentials.yaml`, both
@@ -150,6 +171,12 @@ synced document: it is the bootstrap credential.
 
 ## Known limitations
 
+- **The settings page card is not written yet.** The host half is complete and
+  verified: the namespace is served, status is live, and a request token runs
+  a sync. What is missing is the browser half — a client bundle registered
+  under `settings.plugin.item` for the `oss-sync` key. Until it exists, the
+  Plugins page renders nothing for this namespace, and the fields above are
+  edited by writing `settings.yaml` in the bucket directly.
 - **No `.env` fallback.** `dsh-credentials-local` layers the process
   environment, the stored file, `<cwd>/.env`, and `$DSH_HOME/.env`. This
   provider layers the environment and the bucket only. Put values that used to

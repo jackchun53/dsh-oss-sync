@@ -13,7 +13,7 @@ export class PollLoop {
   private stopped = false
 
   constructor(
-    private readonly intervalMs: number,
+    private intervalMs: number,
     private readonly tick: () => Promise<void>,
     private readonly onError: (error: unknown) => void,
   ) {}
@@ -21,12 +21,30 @@ export class PollLoop {
   /** Begin polling. The timer is unref'd, so a one-shot CLI run still exits. */
   start(): void {
     if (this.stopped || this.timer !== undefined) return
-    this.timer = setInterval(() => {
+    this.timer = this.schedule()
+  }
+
+  /**
+   * Change the interval at runtime; the in-flight tick settles first.
+   * @param intervalMs - the new interval in milliseconds.
+   */
+  restart(intervalMs: number): void {
+    if (this.stopped) return
+    if (this.timer !== undefined) clearInterval(this.timer)
+    this.timer = undefined
+    this.intervalMs = intervalMs
+    this.start()
+  }
+
+  /** Arm the timer; separate so a restart reuses the identical callback. */
+  private schedule(): NodeJS.Timeout {
+    const timer = setInterval(() => {
       this.inFlight = this.inFlight.then(async () => {
         if (!this.stopped) await this.tick()
       }).catch(this.onError)
     }, this.intervalMs)
-    this.timer.unref()
+    timer.unref()
+    return timer
   }
 
   /** Stop polling and wait for the in-flight tick. */
