@@ -225,6 +225,16 @@ class CardController {
     const state = this.snapshot.getSnapshot()
     const pending = FIELDS.filter(entry => state.drafts[entry.field] !== undefined)
     if (pending.length === 0) return
+    // The credential pair is saved field by field, and the store refuses a
+    // half pair — so a save that would leave exactly one side set is refused
+    // here instead of erroring one field later.
+    const fieldAfter = (field: string): string =>
+      state.drafts[field] ?? renderValue(state.values[field])
+    const halfPair = (fieldAfter('accessKeyId').length === 0) !== (fieldAfter('secretAccessKey').length === 0)
+    if (halfPair) {
+      this.snapshot.set({ ...state, failure: '访问密钥 ID 与 Secret 必须同时填写或同时清空' })
+      return
+    }
     this.snapshot.set({ ...state, saving: true, failure: undefined })
     try {
       for (const entry of pending) {

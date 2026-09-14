@@ -1,6 +1,6 @@
 {
   "name": "dsh-oss-sync",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Object-storage providers for the DeepSeek Harness settings and credential seams, with a settings-page card",
   "type": "module",
   "main": "lib/index.js",
