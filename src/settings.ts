@@ -553,9 +553,11 @@ export class OssSettingsProvider extends SettingsProvider {
   private publishDocument(): void {
     // `configured` is a fact about the store in force, not about the last time
     // a provider reported: the page saving a bucket must not keep showing the
-    // local-only line until the next poll.
+    // local-only line until the next poll. Only this provider's own label is
+    // stamped — the credentials half reports its own store, and a bucket saved
+    // here must not make its line claim a connection that half has not made.
     const status = Object.fromEntries(Object.entries(this.status).map(([label, entry]) => (
-      [label, { ...entry, configured: this.store.configured }]
+      [label, label === STATUS_LABEL ? { ...entry, configured: this.store.configured } : entry]
     ))) as SyncStatusMap
     const section = { ...(this.local[SYNC_NAMESPACE] ?? {}), status } as Record<string, unknown>
     const document: SettingsDocument = { ...this.local, [SYNC_NAMESPACE]: section }

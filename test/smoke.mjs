@@ -309,6 +309,17 @@ try {
   await waitFor(() => !existsSync(connectionFile), 'clearing the pair to remove the local file')
   console.log('ok  credentials: clearing both fields removes the locally saved pair')
 
+  // ── the status stamp belongs to one provider ────────────────────────────
+  // The page saving a bucket must update this provider's line without making
+  // another provider's line claim a connection that half has not made.
+  const stamp = await boot(OssSettingsProvider, { ...machineConfig(join(root, 'stamp')), bucket: '' })
+  cleanups.push(() => stamp.fiber.dispose())
+  stamp.ctx.ossSyncControl.report('ghost', { configured: true })
+  const stamped = stamp.ctx.settings.get('oss-sync').status
+  assert.equal(stamped.settings.configured, false, 'this provider reports its own store')
+  assert.equal(stamped.ghost.configured, true, 'another provider\'s line keeps what it reported')
+  console.log('ok  status: `configured` is stamped per provider, not across them')
+
   // ── another machine's write reaches this one through the poll ────────────
   const observer = await boot(OssCredentialProvider, { ...machineConfig(join(root, 'creds-b')), pollMs: 1000 })
   cleanups.push(() => observer.fiber.dispose())
