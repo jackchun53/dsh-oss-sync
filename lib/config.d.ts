@@ -11,10 +11,16 @@
  * @module dsh-oss-sync/config
  */
 import z from '@deepseek-ai/schemastery';
+import type { StoredConnection } from './envelope.js';
 /** Entry config: the bootstrap values a cold start needs. */
 export interface Config {
-    /** Bucket holding the synced documents. */
-    bucket: string;
+    /**
+     * Bucket holding the synced documents. Absent means "not configured yet":
+     * the providers run local-only — every namespace still resolves from this
+     * machine's document, nothing is read or written to a service — so the
+     * settings card is reachable to supply one.
+     */
+    bucket?: string;
     /** Endpoint of an S3-compatible service (MinIO, Ceph, COS); omit for AWS itself. */
     endpoint?: string;
     /** Region sent with every request; a gateway that ignores regions still needs one. */
@@ -29,6 +35,13 @@ export interface Config {
     secretAccessKeyEnv?: string;
     /** Milliseconds between polls for another machine's committed writes. */
     pollMs?: number;
+    /**
+     * Access key id for the bucket, as this machine typed it. Local-only: it is
+     * never written to the bucket, which could not be read without it.
+     */
+    accessKeyId?: string;
+    /** Secret access key for the bucket, kept on this machine like {@link Config.accessKeyId}. */
+    secretAccessKey?: string;
     /** Directory holding the device id and the offline read cache. */
     stateDir?: string;
 }
@@ -43,6 +56,8 @@ export interface SpecOverrides {
     forcePathStyle?: boolean;
     accessKeyIdEnv?: string;
     secretAccessKeyEnv?: string;
+    accessKeyId?: string;
+    secretAccessKey?: string;
     pollMs?: number;
 }
 /** Every parameter with its default applied; programmatic construction bypasses the schema. */
@@ -54,6 +69,8 @@ export interface ResolvedConfig {
     forcePathStyle: boolean;
     accessKeyIdEnv: string;
     secretAccessKeyEnv: string;
+    accessKeyId?: string;
+    secretAccessKey?: string;
     pollMs: number;
     stateDir: string;
 }
@@ -76,6 +93,15 @@ export declare function resolveConfig(config: Config): ResolvedConfig;
  * @returns the parameters the providers act on now.
  */
 export declare function applyOverrides(base: ResolvedConfig, overrides: SpecOverrides | undefined): ResolvedConfig;
+/**
+ * Fold the credentials the settings page saved on this machine over the entry
+ * config. They are a bootstrap layer: the store needs them before the first
+ * read, which is earlier than any namespace resolves.
+ * @param base - parameters resolved from the entry config and the environment.
+ * @param connection - this machine's stored pair, when it has one.
+ * @returns the parameters a cold start should use.
+ */
+export declare function mergeConnection(base: ResolvedConfig, connection: StoredConnection | undefined): ResolvedConfig;
 /**
  * Whether two resolved parameters address the same storage the same way.
  * @param left - one parameter set.

@@ -36,6 +36,16 @@ export class PollLoop {
     this.start()
   }
 
+  /**
+   * Suspend ticks without ending the loop. The providers pause while no bucket
+   * is configured — there is nothing to poll — and {@link start} or
+   * {@link restart} resumes afterwards.
+   */
+  pause(): void {
+    if (this.timer !== undefined) clearInterval(this.timer)
+    this.timer = undefined
+  }
+
   /** Arm the timer; separate so a restart reuses the identical callback. */
   private schedule(): NodeJS.Timeout {
     const timer = setInterval(() => {

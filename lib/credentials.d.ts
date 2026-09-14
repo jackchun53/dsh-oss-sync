@@ -112,7 +112,35 @@ export declare class OssCredentialProvider extends CredentialProvider {
      * machine's cache when the service is unreachable.
      */
     private load;
+    /**
+     * This machine's own copy of the document: what a start without a bucket and
+     * an unreachable bucket both fall back to.
+     * @returns the cached document, or `undefined` while this machine has none.
+     */
+    private loadCache;
     [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void>;
+    /**
+     * Put this machine's saved bucket credentials in force, before the first read.
+     *
+     * The settings half owns the file; this half reads the same one so a cold
+     * start reaches the bucket without waiting for the sync namespace. A
+     * hand-edited half pair is ignored rather than fatal.
+     */
+    private adoptStoredConnection;
+    /**
+     * Report a bucket this process cannot use yet.
+     * @returns the failure's text, or `undefined` when storage preflight passed
+     *   (including the local-only start, which contacts nothing).
+     */
+    private preflight;
+    /**
+     * Adopt the parameters the page resolved. A connection the page asked for
+     * may be unreachable or lack credentials; that is a status line the card
+     * shows, never a reason to take the host or the page down.
+     */
+    private reconcileOrReport;
+    /** Poll only while a bucket is configured; a cleared bucket suspends the loop. */
+    private applyPoll;
     /**
      * Re-commit this machine's document, which is what a `push` request asks
      * for. The write keeps the same precondition as any other, so a remote that
@@ -141,10 +169,22 @@ export declare class OssCredentialProvider extends CredentialProvider {
      * @returns the resulting document and whether storage was written.
      */
     private commit;
+    /**
+     * Apply one edit without storage, for the machine that has no bucket yet.
+     *
+     * The page is what configures the connection, and a key pasted before the
+     * bucket exists is not lost: the document stays in memory and in the cache,
+     * and the first bucket saved here seeds it to that location.
+     * @param edit - the edit, applied to the document this process holds.
+     * @returns the resulting document and whether it changed.
+     */
+    private commitLocally;
     /** Read storage once and notify every reference and record another machine changed. */
     private refresh;
     /** Refuse a write while a read-only ambient value shadows the reference. */
     private refuseShadowed;
+    /** Set while the exclusive section runs, so a nested step joins it instead of queueing behind it. */
+    private exclusive;
     /** Queue one exclusive operation behind every earlier one. */
     private enqueue;
 }

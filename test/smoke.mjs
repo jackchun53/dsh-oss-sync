@@ -5,6 +5,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -81,6 +82,8 @@ try {
   assert.match(stored, /alpha:/u, 'the first machine\'s section survived the second machine\'s write')
   assert.match(stored, /beta:/u, 'the second machine\'s section was written')
   assert.match(stored, /rev: 2/u, 'the revision advanced once per committed write')
+  assert.ok(!/status:/u.test(stored), 'the runtime status never reaches the bucket')
+  assert.ok(!/request:/u.test(stored), 'a sync request never reaches the bucket')
   console.log('ok  settings: two stale writers merged into one document')
 
   // A write presenting a stale ETag must be refused, not applied.
@@ -182,6 +185,129 @@ try {
   const after = panel.ctx.settings.get('oss-sync').status.settings.lastReadAt
   assert.notEqual(after, before, 'the request token ran a sync')
   console.log('ok  panel: the request token triggers a sync on demand')
+
+  // ── the local-only start: boot, configure from the page, then sync ────────
+  const draftDir = join(root, 'draft')
+  const draft = await boot(OssSettingsProvider, { ...machineConfig(draftDir), bucket: '' })
+  cleanups.push(() => draft.fiber.dispose())
+  const draftStatus = () => draft.ctx.settings.get('oss-sync').status.settings
+  assert.equal(draftStatus().configured, false, 'a machine with no bucket reports the local-only start')
+  assert.equal(draftStatus().state, 'idle', 'starting without a bucket is not an error')
+
+  // The seam is what the page configures the connection through, so it has to
+  // work before a connection exists.
+  const draftProbe = draft.ctx.settings.register('draft-probe', Schema)
+  await draftProbe.update({ value: 11 })
+  assert.equal(draftProbe.get().value, 11, 'a namespace resolves with no bucket configured')
+  assert.ok(![...service.objects.keys()].some(key => key.startsWith('draft/')), 'nothing reached a service')
+
+  // Saving the bucket from the page is what gives this machine a remote home.
+  await draft.ctx.settings.update('oss-sync', { bucket: 'test', prefix: 'draft' })
+  await waitFor(() => draftStatus().configured === true, 'the provider to report the bucket the page saved')
+  const seeded = service.objects.get('draft/settings.yaml')
+  assert.ok(seeded, 'the bucket saved from the page was seeded from this machine')
+  assert.match(seeded, /draft-probe:/u, 'the section written before the bucket existed was carried into it')
+  assert.match(seeded, /bucket: test/u, 'the connection parameters are stored as configuration')
+  console.log('ok  local-only: a machine boots with no bucket, is configured from the page, and seeds it')
+
+  // The bucket the page saved survives a restart, which is what makes the
+  // settings page the configuration entry point rather than the environment.
+  await draft.fiber.dispose()
+  cleanups.pop()
+  const restarted = await boot(OssSettingsProvider, { ...machineConfig(draftDir), bucket: '' })
+  cleanups.push(() => restarted.fiber.dispose())
+  assert.equal(restarted.ctx.settings.get('oss-sync').bucket, 'test',
+    'a restart reads the connection parameters back from this machine\'s cache')
+  assert.equal(restarted.ctx.settings.get('oss-sync').status.settings.configured, true,
+    'the restarted machine reaches the bucket the page saved')
+  assert.equal(restarted.ctx.settings.register('draft-probe', Schema).get().value, 11,
+    'the cached document survives the restart')
+  console.log('ok  local-only: the bucket saved from the page survives a restart')
+
+  // The credential half has the same local-only start: a key pasted before the
+  // bucket exists is kept here and seeds the bucket later.
+  const localCredentials = await boot(OssCredentialProvider, { ...machineConfig(join(root, 'local-creds')), bucket: '' })
+  cleanups.push(() => localCredentials.fiber.dispose())
+  await localCredentials.ctx.credentials.set('LOCAL_ONLY_KEY', 'sk-local')
+  assert.deepEqual(await localCredentials.ctx.credentials.resolve('LOCAL_ONLY_KEY'), { value: 'sk-local', source: 'oss' },
+    'a key pasted before the bucket exists is kept on this machine')
+  assert.ok(![...service.objects.keys()].some(key => key.startsWith('dsh-sync/') && key.includes('local-creds')),
+    'the local-only credential write reached no service')
+  console.log('ok  local-only: credentials accept a value before a bucket exists')
+
+  // ── both halves in one context, which is what a surface mounts ────────────
+  const joinedCtx = new Context()
+  const joinedSettings = joinedCtx.plugin(OssSettingsProvider, { ...machineConfig(join(root, 'joined')), bucket: '' })
+  const joinedCredentials = joinedCtx.plugin(OssCredentialProvider, { ...machineConfig(join(root, 'joined-creds')), bucket: '' })
+  await joinedSettings
+  await joinedCredentials
+  cleanups.push(() => joinedSettings.dispose(), () => joinedCredentials.dispose())
+  await joinedCtx.credentials.set('JOINED_KEY', 'sk-joined')
+  assert.equal(joinedCtx.settings.get('oss-sync').status.settings.configured, false,
+    'both halves start local-only together')
+  await joinedCtx.settings.update('oss-sync', { bucket: 'test', prefix: 'joined' })
+  await waitFor(() => joinedCtx.settings.get('oss-sync').status.credentials.configured === true,
+    'the credential half to follow the settings half')
+  assert.match(service.objects.get('joined/credentials.yaml'), /sk-joined/u,
+    'the value pasted while local-only was carried to the bucket the page saved')
+  assert.match(service.objects.get('joined/settings.yaml'), /oss-sync:/u,
+    'the settings document reached the same bucket')
+  console.log('ok  local-only: saving a bucket on the page moves both documents at once')
+
+  // ── a pair typed on the page stays on this machine ──────────────────────
+  // Deliberately nothing to fall back on: the pair saved from the page is the
+  // only thing that can make this machine reach the bucket.
+  delete process.env['AWS_ACCESS_KEY_ID']
+  delete process.env['AWS_SECRET_ACCESS_KEY']
+  delete process.env['AWS_SESSION_TOKEN']
+  delete process.env['AWS_PROFILE']
+  process.env['AWS_SHARED_CREDENTIALS_FILE'] = join(root, 'absent-credentials')
+  process.env['AWS_CONFIG_FILE'] = join(root, 'absent-config')
+  const keyedDir = join(root, 'keyed')
+  const keyed = await boot(OssSettingsProvider, {
+    ...machineConfig(keyedDir),
+    bucket: '',
+    accessKeyIdEnv: 'KEYED_ACCESS_KEY_ID',
+    secretAccessKeyEnv: 'KEYED_SECRET_ACCESS_KEY',
+  })
+  cleanups.push(() => keyed.fiber.dispose())
+  const keyedStatus = () => keyed.ctx.settings.get('oss-sync').status.settings
+  const connectionFile = join(keyedDir, 'connection.yaml')
+  await keyed.ctx.settings.update('oss-sync', {
+    bucket: 'test', prefix: 'keyed', accessKeyId: 'AKIA-LOCAL', secretAccessKey: 'sk-local',
+  })
+  await waitFor(() => service.objects.has('keyed/settings.yaml'), 'the keyed machine to seed the bucket')
+  assert.equal(keyedStatus().state, 'idle', `the saved pair reached the bucket: ${String(keyedStatus().lastError)}`)
+  const keyedStored = service.objects.get('keyed/settings.yaml')
+  assert.ok(!/accessKeyId|secretAccessKey|sk-local|AKIA-LOCAL/u.test(keyedStored),
+    'the bucket credentials never reach the bucket')
+  assert.match(readFileSync(connectionFile, 'utf8'), /AKIA-LOCAL/u, 'the pair is kept on this machine')
+  console.log('ok  credentials: a pair typed on the page authenticates without reaching the bucket')
+
+  // The stored pair is what a cold start reads, so a machine that never sees
+  // the environment still reaches its bucket.
+  await keyed.fiber.dispose()
+  cleanups.pop()
+  const keyedRestart = await boot(OssSettingsProvider, {
+    ...machineConfig(keyedDir),
+    bucket: '',
+    accessKeyIdEnv: 'KEYED_ACCESS_KEY_ID',
+    secretAccessKeyEnv: 'KEYED_SECRET_ACCESS_KEY',
+  })
+  cleanups.push(() => keyedRestart.fiber.dispose())
+  const restartedStatus = () => keyedRestart.ctx.settings.get('oss-sync').status.settings
+  assert.equal(restartedStatus().configured, true, 'the restart reads the bucket back from its cache')
+  await keyedRestart.ctx.settings.update('oss-sync', { request: 'read-now' })
+  await waitFor(() => restartedStatus().lastReadAt !== undefined, 'the restarted machine to read the bucket')
+  assert.equal(restartedStatus().state, 'idle',
+    `the stored pair authenticated the restart: ${String(restartedStatus().lastError)}`)
+  console.log('ok  credentials: a restart authenticates from the pair saved on this machine')
+
+  // Emptying both fields deletes the local file, which is the only way back to
+  // the environment or the SDK chain.
+  await keyedRestart.ctx.settings.update('oss-sync', { accessKeyId: '', secretAccessKey: '' })
+  await waitFor(() => !existsSync(connectionFile), 'clearing the pair to remove the local file')
+  console.log('ok  credentials: clearing both fields removes the locally saved pair')
 
   // ── another machine's write reaches this one through the poll ────────────
   const observer = await boot(OssCredentialProvider, { ...machineConfig(join(root, 'creds-b')), pollMs: 1000 })

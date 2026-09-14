@@ -19,13 +19,15 @@ import { Service } from '@deepseek-ai/cordis'
 import { SettingsProvider, type SettingsNamespace, type SettingsScope } from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import {
-  ConfigSchema, applyOverrides, resolveConfig, sameConnection, type Config, type ResolvedConfig,
+  ConfigSchema, applyOverrides, mergeConnection, resolveConfig, sameConnection, type Config, type ResolvedConfig,
 } from './config.js'
 import {
-  SYNC_NAMESPACE, requestVerb, storedDocument, storedSection, type SyncControl, type SyncParticipant, type SyncSettings,
-  type SyncStatus, type SyncStatusMap,
+  LOCAL_CREDENTIAL_FIELDS, SYNC_NAMESPACE, requestVerb, storedDocument, storedSection, type SyncControl,
+  type SyncParticipant, type SyncSettings, type SyncStatus, type SyncStatusMap,
 } from './control.js'
-import { ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope } from './envelope.js'
+import {
+  ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope, type StoredConnection,
+} from './envelope.js'
 import { PollLoop } from './poll.js'
 import { ObjectStore, PreconditionFailedError } from './store.js'
 
@@ -51,6 +53,8 @@ const SyncSettingsSchema: z<SyncSettings> = z.object({
   forcePathStyle: z.boolean(),
   accessKeyIdEnv: z.string(),
   secretAccessKeyEnv: z.string(),
+  accessKeyId: z.string(),
+  secretAccessKey: z.string(),
   status: z.any(),
   request: z.string(),
 })
@@ -75,6 +79,8 @@ export class OssSettingsProvider extends SettingsProvider {
 
   /** Parameters the entry config supplies; the namespace overrides them. */
   private readonly bootstrap: ResolvedConfig
+  /** The bucket credentials this machine saved from the settings page, if any. */
+  private connection: StoredConnection | undefined
   private readonly state: SyncState
   /** Parameters in force now. */
   private spec: ResolvedConfig
@@ -127,29 +133,39 @@ export class OssSettingsProvider extends SettingsProvider {
    * object that is not an envelope this plugin understands is refused.
    */
   protected override async load(): Promise<Record<string, unknown>> {
+    // With no bucket there is no remote to read, and nothing to report: the
+    // page is about to be where one is set.
+    if (!this.store.configured) return await this.loadCache() ?? {}
     try {
       const remote = await this.store.read(this.key)
       if (remote === undefined) {
         // No stored revision yet: keep whatever this machine last cached, so
         // the first writer seeds the bucket instead of erasing its own state.
-        const cached = await this.state.readCache<SettingsDocument>(OBJECT_NAME)
+        const cached = await this.loadCache()
         if (cached === undefined) return {}
-        this.local = cached.doc
-        this.revision = cached.rev
         this.ctx.logger.warn('dsh-oss-sync: %s does not exist yet; seeding from the local cache', this.key)
-        return cached.doc
+        return cached
       }
       const envelope = parseEnvelope<SettingsDocument>(remote.text)
       return this.adopt(envelope, remote.etag)
     } catch (error) {
-      const cached = await this.state.readCache<SettingsDocument>(OBJECT_NAME)
       this.ctx.logger.warn('dsh-oss-sync: could not read %s; running from the local cache', this.key)
       this.ctx.logger.warn(error)
-      if (cached === undefined) return {}
-      this.local = cached.doc
-      this.revision = cached.rev
-      return cached.doc
+      return await this.loadCache() ?? {}
     }
+  }
+
+  /**
+   * This machine's own copy of the document: what a start without a bucket and
+   * an unreachable bucket both fall back to.
+   * @returns the cached document, or `undefined` while this machine has none.
+   */
+  private async loadCache(): Promise<SettingsDocument | undefined> {
+    const cached = await this.state.readCache<SettingsDocument>(OBJECT_NAME)
+    if (cached === undefined) return undefined
+    this.local = cached.doc
+    this.revision = cached.rev
+    return cached.doc
   }
 
   /**
@@ -161,10 +177,13 @@ export class OssSettingsProvider extends SettingsProvider {
    * re-reads and re-applies, so the loser of the race retries against the
    * winner's document rather than overwriting it.
    */
-  protected override persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
-    // The sync namespace's own section carries runtime facts; storage keeps
-    // the connection parameters and drops the rest.
+  protected override async persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
+    // The sync namespace's own section carries runtime facts and this machine's
+    // bucket credentials; storage keeps the connection parameters and drops the
+    // rest.
     const next = ns === SYNC_NAMESPACE ? storedSection(section) : section
+    if (ns === SYNC_NAMESPACE) await this.syncStoredConnection(section)
+    if (!this.store.configured) return this.commitLocally(ns, section, next)
     return this.enqueue(async () => {
       for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
         let remote
@@ -176,10 +195,12 @@ export class OssSettingsProvider extends SettingsProvider {
         const stored = remote === undefined ? undefined : parseEnvelope<SettingsDocument>(remote.text)
         // A vanished object with a revision already observed means another
         // machine deleted the document; without one, a machine that started
-        // offline seeds storage from the state it already carries.
+        // offline seeds storage from the state it already carries. Either way
+        // the runtime fields come off: the seam's document holds this process's
+        // status, and storage keeps configuration only.
         const base: SettingsDocument = remote === undefined
-          ? (this.etag === undefined ? this.local : {})
-          : stored?.doc ?? {}
+          ? (this.etag === undefined ? storedDocument(this.local) : {})
+          : stored === undefined ? {} : storedDocument(stored.doc)
         const document: SettingsDocument = { ...base, [ns]: next }
         const envelope: Envelope<SettingsDocument> = {
           v: ENVELOPE_VERSION,
@@ -216,25 +237,117 @@ export class OssSettingsProvider extends SettingsProvider {
     })
   }
 
+  /**
+   * Commit one edit without storage, for the machine that has no bucket yet.
+   *
+   * The seam is what the page configures the connection through, so it has to
+   * work before a connection exists: the document stays in memory and in the
+   * cache, and the first bucket saved here seeds it to that location.
+   * @param ns - the namespace being written.
+   * @param section - the section as the seam holds it, runtime fields included.
+   * @param stored - the section narrowed to what storage would keep.
+   */
+  private commitLocally(
+    ns: SettingsNamespace, section: Record<string, unknown>, stored: Record<string, unknown>,
+  ): Promise<void> {
+    return this.enqueue(async () => {
+      const envelope: Envelope<SettingsDocument> = {
+        v: ENVELOPE_VERSION,
+        rev: this.revision + 1,
+        writer: await this.state.deviceId(),
+        updatedAt: new Date().toISOString(),
+        doc: { ...storedDocument(this.local), [ns]: stored },
+      }
+      this.revision = envelope.rev
+      this.local = { ...envelope.doc, [ns]: section }
+      await this.state.writeCache(OBJECT_NAME, envelope)
+      this.report(STATUS_LABEL, { state: 'idle', lastError: undefined })
+      setImmediate(() => {
+        if (!this.closed) this.publishDocument()
+      })
+    })
+  }
+
+  /**
+   * Put this machine's saved bucket credentials in force, before the first read.
+   *
+   * They are deliberately local: reading the document is what needs them, so
+   * they cannot live in it. A hand-edited half pair is ignored rather than
+   * fatal — the entry config still applies and the card can repair it.
+   */
+  private async adoptStoredConnection(): Promise<void> {
+    this.connection = await this.state.readConnection()
+    const merged = mergeConnection(this.bootstrap, this.connection)
+    if (sameConnection(merged, this.spec)) return
+    try {
+      const replacement = new ObjectStore(merged)
+      this.store.destroy()
+      this.store = replacement
+      this.spec = merged
+    } catch (error) {
+      this.ctx.logger.error('dsh-oss-sync: ignoring the bucket credentials saved on this machine')
+      this.ctx.logger.error(error)
+      this.connection = undefined
+    }
+  }
+
+  /** The composition layer the sync namespace resolves over. */
+  private baseLayer(): SyncSettings {
+    const { stateDir: _stateDir, ...base } = { ...this.bootstrap, ...this.connection }
+    return base
+  }
+
+  /**
+   * Keep this machine's copy of the bucket credentials in step with the page.
+   *
+   * A half-filled pair is left alone until the save is complete, so the store
+   * is never rebuilt around half a credential.
+   * @param section - the merged user section as the seam holds it.
+   */
+  private async syncStoredConnection(section: Record<string, unknown>): Promise<void> {
+    if (!('accessKeyId' in section) && !('secretAccessKey' in section)) return
+    const text = (field: string): string | undefined => {
+      const value = section[field]
+      return typeof value === 'string' && value.length > 0 ? value : undefined
+    }
+    const accessKeyId = text('accessKeyId')
+    const secretAccessKey = text('secretAccessKey')
+    if (accessKeyId === undefined && secretAccessKey === undefined) {
+      this.connection = undefined
+      await this.state.writeConnection()
+      return
+    }
+    if (accessKeyId === undefined || secretAccessKey === undefined) return
+    this.connection = { accessKeyId, secretAccessKey }
+    await this.state.writeConnection(this.connection)
+  }
+
   override async* [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void> {
-    await this.store.preflight()
+    // This machine's own copy of the bucket credentials is a bootstrap layer:
+    // the store needs them before the first read, which happens before any
+    // namespace resolves.
+    await this.adoptStoredConnection()
+    // A bucket this process cannot authenticate against is a status line, not
+    // a reason to refuse to boot: the cache still serves this machine, and the
+    // settings card reports the variables that are missing.
+    const preflightError = await this.preflight()
     // The base init loads and publishes; an unreadable bucket has already
     // fallen back to the cache there, so this cannot fail on an offline host.
     yield* super[Service.init]()
-    this.scope = this.register(SYNC_NAMESPACE, SyncSettingsSchema, { base: this.bootstrap })
+    this.scope = this.register(SYNC_NAMESPACE, SyncSettingsSchema, { base: this.baseLayer() })
     this.ctx.provide('ossSyncControl', this.createControl())
-    const current = this.scope.get()
-    await this.reconcile(current)
+    await this.reconcileOrReport(this.scope.get())
     this.scope.watch(next => this.onSettings(next))
     this.report(STATUS_LABEL, {
-      state: 'idle',
+      state: preflightError === undefined ? 'idle' : 'error',
+      ...preflightError === undefined ? {} : { lastError: preflightError },
       revision: this.revision,
       writer: '',
       updatedAt: '',
       deviceId: await this.state.deviceId(),
       objectKey: this.key,
     })
-    this.poll.start()
+    this.applyPoll()
     yield async () => {
       this.closed = true
       await this.poll.stop()
@@ -264,7 +377,45 @@ export class OssSettingsProvider extends SettingsProvider {
       await this.runRequested(next.request)
       return
     }
-    await this.reconcile(next)
+    await this.reconcileOrReport(next)
+  }
+
+  /**
+   * Report a bucket this process cannot use yet.
+   * @returns the failure's text, or `undefined` when storage preflight passed
+   *   (including the local-only start, which contacts nothing).
+   */
+  private async preflight(): Promise<string | undefined> {
+    try {
+      await this.store.preflight()
+      return undefined
+    } catch (error) {
+      this.ctx.logger.error('dsh-oss-sync: storage is not usable yet; serving this machine\'s cached document')
+      this.ctx.logger.error(error)
+      return String(error)
+    }
+  }
+
+  /**
+   * Adopt the settings the page resolved. A connection the page asked for may
+   * be unreachable or lack credentials; that is a status line the card shows,
+   * never a reason to take the host or the page down.
+   * @param next - the namespace value as the seam resolved it.
+   */
+  private async reconcileOrReport(next: SyncSettings): Promise<void> {
+    try {
+      await this.reconcile(next)
+    } catch (error) {
+      this.ctx.logger.error('dsh-oss-sync: could not apply the sync settings')
+      this.ctx.logger.error(error)
+      this.report(STATUS_LABEL, { state: 'error', lastError: String(error) })
+    }
+  }
+
+  /** Poll only while a bucket is configured; a cleared bucket suspends the loop. */
+  private applyPoll(): void {
+    if (this.spec.bucket.length === 0) this.poll.pause()
+    else this.poll.start()
   }
 
   /** Run the verb a card asked for on this provider and every participant. */
@@ -290,6 +441,7 @@ export class OssSettingsProvider extends SettingsProvider {
     if (desired.pollMs !== this.spec.pollMs) this.poll.restart(desired.pollMs)
     if (sameConnection(desired, this.spec) && desired.prefix === this.spec.prefix) {
       this.spec = desired
+      this.applyPoll()
       return
     }
     await this.relocate(desired)
@@ -300,11 +452,22 @@ export class OssSettingsProvider extends SettingsProvider {
     return this.enqueue(async () => {
       const carried = storedDocument(this.local)
       const connectionChanged = !sameConnection(desired, this.spec)
+      // Build the replacement before anything is swapped: a store that cannot
+      // be built must leave this provider on the connection it still serves.
+      const replacement = connectionChanged ? new ObjectStore(desired) : undefined
+      if (replacement !== undefined) this.store.destroy()
       this.spec = desired
       this.key = objectKey(desired)
-      if (connectionChanged) {
-        this.store.destroy()
-        this.store = new ObjectStore(desired)
+      if (replacement !== undefined) {
+        this.store = replacement
+        if (!this.store.configured) {
+          // The page cleared the bucket: keep serving this machine's document
+          // and stop reaching for a service until one is set again.
+          this.etag = undefined
+          this.applyPoll()
+          this.report(STATUS_LABEL, { state: 'idle', lastError: undefined })
+          return
+        }
         await this.store.preflight()
       }
       // The target starts from nothing: read it, and seed it from the document
@@ -330,9 +493,10 @@ export class OssSettingsProvider extends SettingsProvider {
         this.etag = written.etag
         this.revision = envelope.rev
         await this.state.writeCache(OBJECT_NAME, envelope)
-        this.local = carried
+        this.local = this.withLocalFields(carried)
         this.ctx.logger.info('dsh-oss-sync: moved to %s and seeded it from this machine', this.key)
         this.publishDocument()
+        await this.follow()
         return
       }
       const envelope = parseEnvelope<SettingsDocument>(remote.text)
@@ -340,20 +504,60 @@ export class OssSettingsProvider extends SettingsProvider {
       await this.state.writeCache(OBJECT_NAME, envelope)
       this.ctx.logger.info('dsh-oss-sync: moved to %s and adopted revision %d', this.key, envelope.rev)
       this.publishDocument()
+      await this.follow()
     })
+  }
+
+  /**
+   * Move every participant to the location this provider just adopted.
+   *
+   * The credentials half follows the same namespace, and the seam offers no
+   * cross-namespace observer, so without this poke a connection saved on the
+   * page would reach the settings document now and the credential document
+   * only at the next poll — or never, while the local-only start has the poll
+   * suspended.
+   */
+  private async follow(): Promise<void> {
+    await Promise.allSettled([...this.participants.values()].map(participant => participant.refresh()))
   }
 
   /** Adopt one stored revision as this process's document. */
   private adopt(envelope: Envelope<SettingsDocument>, etag: string): SettingsDocument {
     this.etag = etag
     this.revision = envelope.rev
-    this.local = envelope.doc
-    return envelope.doc
+    this.local = this.withLocalFields(envelope.doc)
+    return this.local
+  }
+
+  /**
+   * Adopt a document that came from storage, keeping the fields that only ever
+   * live here.
+   *
+   * Storage never carries this machine's bucket credentials, so a poll that
+   * overwrote the seam with the stored document would erase the pair the page
+   * saved — and the next reconcile would then lose the connection with it.
+   * @param document - the document as stored.
+   * @returns the document the seam holds.
+   */
+  private withLocalFields(document: SettingsDocument): SettingsDocument {
+    const current = this.local[SYNC_NAMESPACE]
+    if (current === undefined) return document
+    const fields = Object.fromEntries(LOCAL_CREDENTIAL_FIELDS
+      .filter(field => current[field] !== undefined)
+      .map(field => [field, current[field]]))
+    if (Object.keys(fields).length === 0) return document
+    return { ...document, [SYNC_NAMESPACE]: { ...document[SYNC_NAMESPACE], ...fields } }
   }
 
   /** Publish the seam's document with the runtime status merged in. */
   private publishDocument(): void {
-    const section = { ...(this.local[SYNC_NAMESPACE] ?? {}), status: { ...this.status } } as Record<string, unknown>
+    // `configured` is a fact about the store in force, not about the last time
+    // a provider reported: the page saving a bucket must not keep showing the
+    // local-only line until the next poll.
+    const status = Object.fromEntries(Object.entries(this.status).map(([label, entry]) => (
+      [label, { ...entry, configured: this.store.configured }]
+    ))) as SyncStatusMap
+    const section = { ...(this.local[SYNC_NAMESPACE] ?? {}), status } as Record<string, unknown>
     const document: SettingsDocument = { ...this.local, [SYNC_NAMESPACE]: section }
     this.local = document
     this.publish(document)
@@ -364,6 +568,7 @@ export class OssSettingsProvider extends SettingsProvider {
     const previous = this.status[label]
     this.status[label] = {
       state: 'idle',
+      configured: this.store.configured,
       revision: this.revision,
       writer: '',
       updatedAt: '',
@@ -381,6 +586,10 @@ export class OssSettingsProvider extends SettingsProvider {
    * moved first wins and this machine reports the pull instead of erasing it.
    */
   private async push(): Promise<void> {
+    if (!this.store.configured) {
+      this.ctx.logger.info('dsh-oss-sync: no bucket configured; there is nowhere to push to yet')
+      return
+    }
     const document = storedDocument(this.local)
     await this.enqueue(async () => {
       const remote = await this.store.read(this.key)
@@ -411,6 +620,7 @@ export class OssSettingsProvider extends SettingsProvider {
   private refresh(): Promise<void> {
     return this.enqueue(async () => {
       if (this.closed) return
+      if (!this.store.configured) return
       let remote
       try {
         remote = await this.store.read(this.key)
@@ -434,9 +644,23 @@ export class OssSettingsProvider extends SettingsProvider {
     })
   }
 
+  /** Set while the exclusive section runs, so a nested step joins it instead of queueing behind it. */
+  private exclusive = false
+
   /** Queue one exclusive operation behind every earlier one. */
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const task = this.operations.then(operation)
+    // A step the running operation awaits — a refresh reconciling a connection
+    // change, whose move is itself exclusive — must run inline: queueing it
+    // would wait for the very operation that is waiting for it.
+    if (this.exclusive) return operation()
+    const task = this.operations.then(async () => {
+      this.exclusive = true
+      try {
+        return await operation()
+      } finally {
+        this.exclusive = false
+      }
+    })
     this.operations = task.then(() => undefined, () => undefined)
     return task
   }

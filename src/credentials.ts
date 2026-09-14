@@ -22,10 +22,12 @@ import {
 } from '@deepseek-ai/dsh-credentials'
 import z from '@deepseek-ai/schemastery'
 import {
-  ConfigSchema, applyOverrides, resolveConfig, sameConnection, type Config, type ResolvedConfig,
+  ConfigSchema, applyOverrides, mergeConnection, resolveConfig, sameConnection, type Config, type ResolvedConfig,
 } from './config.js'
 import { SYNC_NAMESPACE, type SyncControl, type SyncSettings, type SyncStatus } from './control.js'
-import { ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope } from './envelope.js'
+import {
+  ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope, type StoredConnection,
+} from './envelope.js'
 import { PollLoop } from './poll.js'
 import { ObjectStore, PreconditionFailedError } from './store.js'
 
@@ -257,15 +259,16 @@ export class OssCredentialProvider extends CredentialProvider {
    * machine's cache when the service is unreachable.
    */
   private async load(): Promise<CredentialDocument> {
+    // With no bucket there is no remote to read, and nothing to report: the
+    // page is about to be where one is set.
+    if (!this.store.configured) return await this.loadCache() ?? emptyDocument()
     try {
       const remote = await this.store.read(this.key)
       if (remote === undefined) {
-        const cached = await this.state.readCache<CredentialDocument>(OBJECT_NAME)
+        const cached = await this.loadCache()
         if (cached === undefined) return emptyDocument()
-        this.local = asDocument(cached.doc)
-        this.revision = cached.rev
         this.ctx.logger.warn('dsh-oss-sync: %s does not exist yet; seeding from the local cache', this.key)
-        return this.local
+        return cached
       }
       const envelope = parseEnvelope<CredentialDocument>(remote.text)
       this.etag = remote.etag
@@ -274,18 +277,34 @@ export class OssCredentialProvider extends CredentialProvider {
       await this.state.writeCache(OBJECT_NAME, { ...envelope, doc: this.local })
       return this.local
     } catch (error) {
-      const cached = await this.state.readCache<CredentialDocument>(OBJECT_NAME)
       this.ctx.logger.warn('dsh-oss-sync: could not read %s; running from the local cache', this.key)
       this.ctx.logger.warn(error)
-      if (cached === undefined) return emptyDocument()
-      this.local = asDocument(cached.doc)
-      this.revision = cached.rev
-      return this.local
+      return await this.loadCache() ?? emptyDocument()
     }
   }
 
+  /**
+   * This machine's own copy of the document: what a start without a bucket and
+   * an unreachable bucket both fall back to.
+   * @returns the cached document, or `undefined` while this machine has none.
+   */
+  private async loadCache(): Promise<CredentialDocument | undefined> {
+    const cached = await this.state.readCache<CredentialDocument>(OBJECT_NAME)
+    if (cached === undefined) return undefined
+    this.local = asDocument(cached.doc)
+    this.revision = cached.rev
+    return this.local
+  }
+
   async* [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void> {
-    await this.store.preflight()
+    // This machine's own copy of the bucket credentials is a bootstrap layer:
+    // the store needs them before the first read, which happens before any
+    // settings namespace resolves.
+    await this.adoptStoredConnection()
+    // A bucket this process cannot authenticate against is a status line, not
+    // a reason to refuse to boot: the cache still serves this machine, and the
+    // settings card reports the variables that are missing.
+    const preflightError = await this.preflight()
     this.local = await this.load()
     // The settings half owns the sync namespace and provides the handle both
     // providers refresh through, so one card action refreshes the settings
@@ -300,13 +319,13 @@ export class OssCredentialProvider extends CredentialProvider {
     // The namespace overrides the bootstrap parameters, so a page edit reaches
     // this provider without a restart.
     this.ctx.inject(['settings'], () => {
-      void this.reconcile().catch((error: unknown) => {
-        this.ctx.logger.error('dsh-oss-sync: could not apply the sync settings to credentials')
-        this.ctx.logger.error(error)
-      })
+      void this.reconcileOrReport()
     })
-    await this.reconcile()
-    this.poll.start()
+    await this.reconcileOrReport()
+    this.applyPoll()
+    this.report(preflightError === undefined
+      ? { state: 'idle', lastError: undefined }
+      : { state: 'error', lastError: preflightError })
     yield async () => {
       this.closed = true
       await this.poll.stop()
@@ -316,11 +335,74 @@ export class OssCredentialProvider extends CredentialProvider {
   }
 
   /**
+   * Put this machine's saved bucket credentials in force, before the first read.
+   *
+   * The settings half owns the file; this half reads the same one so a cold
+   * start reaches the bucket without waiting for the sync namespace. A
+   * hand-edited half pair is ignored rather than fatal.
+   */
+  private async adoptStoredConnection(): Promise<void> {
+    const connection: StoredConnection | undefined = await this.state.readConnection()
+    const merged = mergeConnection(this.bootstrap, connection)
+    if (sameConnection(merged, this.spec)) return
+    try {
+      const replacement = new ObjectStore(merged)
+      this.store.destroy()
+      this.store = replacement
+      this.spec = merged
+    } catch (error) {
+      this.ctx.logger.error('dsh-oss-sync: ignoring the bucket credentials saved on this machine')
+      this.ctx.logger.error(error)
+    }
+  }
+
+  /**
+   * Report a bucket this process cannot use yet.
+   * @returns the failure's text, or `undefined` when storage preflight passed
+   *   (including the local-only start, which contacts nothing).
+   */
+  private async preflight(): Promise<string | undefined> {
+    try {
+      await this.store.preflight()
+      return undefined
+    } catch (error) {
+      this.ctx.logger.error('dsh-oss-sync: storage is not usable yet; serving this machine\'s cached document')
+      this.ctx.logger.error(error)
+      return String(error)
+    }
+  }
+
+  /**
+   * Adopt the parameters the page resolved. A connection the page asked for
+   * may be unreachable or lack credentials; that is a status line the card
+   * shows, never a reason to take the host or the page down.
+   */
+  private async reconcileOrReport(): Promise<void> {
+    try {
+      await this.reconcile()
+    } catch (error) {
+      this.ctx.logger.error('dsh-oss-sync: could not apply the sync settings to credentials')
+      this.ctx.logger.error(error)
+      this.report({ state: 'error', lastError: String(error) })
+    }
+  }
+
+  /** Poll only while a bucket is configured; a cleared bucket suspends the loop. */
+  private applyPoll(): void {
+    if (this.spec.bucket.length === 0) this.poll.pause()
+    else this.poll.start()
+  }
+
+  /**
    * Re-commit this machine's document, which is what a `push` request asks
    * for. The write keeps the same precondition as any other, so a remote that
    * moved first wins and this machine reports the pull instead of erasing it.
    */
   private async push(): Promise<void> {
+    if (!this.store.configured) {
+      this.ctx.logger.info('dsh-oss-sync: no bucket configured; there is nowhere to push to yet')
+      return
+    }
     const document = this.local
     await this.enqueue(async () => {
       const remote = await this.store.read(this.key)
@@ -363,6 +445,7 @@ export class OssCredentialProvider extends CredentialProvider {
     if (desired.pollMs !== this.spec.pollMs) this.poll.restart(desired.pollMs)
     if (sameConnection(desired, this.spec) && desired.prefix === this.spec.prefix) {
       this.spec = desired
+      this.applyPoll()
       return
     }
     return this.relocate(desired)
@@ -373,11 +456,22 @@ export class OssCredentialProvider extends CredentialProvider {
     return this.enqueue(async () => {
       const carried = this.local
       const connectionChanged = !sameConnection(desired, this.spec)
+      // Build the replacement before anything is swapped: a store that cannot
+      // be built must leave this provider on the connection it still serves.
+      const replacement = connectionChanged ? new ObjectStore(desired) : undefined
+      if (replacement !== undefined) this.store.destroy()
       this.spec = desired
       this.key = `${desired.prefix}/${OBJECT_NAME}`
-      if (connectionChanged) {
-        this.store.destroy()
-        this.store = new ObjectStore(desired)
+      if (replacement !== undefined) {
+        this.store = replacement
+        if (!this.store.configured) {
+          // The page cleared the bucket: keep serving this machine's document
+          // and stop reaching for a service until one is set again.
+          this.etag = undefined
+          this.applyPoll()
+          this.report({ state: 'idle', lastError: undefined })
+          return
+        }
         await this.store.preflight()
       }
       // The target starts from nothing: read it, and seed it from the document
@@ -419,6 +513,7 @@ export class OssCredentialProvider extends CredentialProvider {
   /** Merge this provider's status into the published sync namespace. */
   private report(patch: Partial<SyncStatus>): void {
     this.control?.report(STATUS_LABEL, {
+      configured: this.store.configured,
       objectKey: this.key,
       revision: this.revision,
       state: 'idle',
@@ -438,6 +533,7 @@ export class OssCredentialProvider extends CredentialProvider {
   private async commit(
     edit: (document: CredentialDocument) => CredentialDocument | undefined | Promise<CredentialDocument | undefined>,
   ): Promise<{ doc: CredentialDocument, written: boolean }> {
+    if (!this.store.configured) return this.commitLocally(edit)
     for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
       let remote
       try {
@@ -480,11 +576,41 @@ export class OssCredentialProvider extends CredentialProvider {
     throw new Error(`dsh-oss-sync: gave up writing ${this.key} after ${String(MAX_WRITE_ATTEMPTS)} attempts`)
   }
 
+  /**
+   * Apply one edit without storage, for the machine that has no bucket yet.
+   *
+   * The page is what configures the connection, and a key pasted before the
+   * bucket exists is not lost: the document stays in memory and in the cache,
+   * and the first bucket saved here seeds it to that location.
+   * @param edit - the edit, applied to the document this process holds.
+   * @returns the resulting document and whether it changed.
+   */
+  private async commitLocally(
+    edit: (document: CredentialDocument) => CredentialDocument | undefined | Promise<CredentialDocument | undefined>,
+  ): Promise<{ doc: CredentialDocument, written: boolean }> {
+    const base = this.local
+    const next = await edit(base)
+    if (next === undefined) return { doc: base, written: false }
+    const envelope: Envelope<CredentialDocument> = {
+      v: ENVELOPE_VERSION,
+      rev: this.revision + 1,
+      writer: await this.state.deviceId(),
+      updatedAt: new Date().toISOString(),
+      doc: next,
+    }
+    this.revision = envelope.rev
+    this.local = next
+    await this.state.writeCache(OBJECT_NAME, envelope)
+    this.report({ state: 'idle', revision: envelope.rev, lastWriteAt: envelope.updatedAt, lastError: undefined })
+    return { doc: next, written: true }
+  }
+
   /** Read storage once and notify every reference and record another machine changed. */
   private refresh(): Promise<void> {
     return this.enqueue(async () => {
       if (this.closed) return
-      await this.reconcile()
+      await this.reconcileOrReport()
+      if (!this.store.configured) return
       let remote
       try {
         remote = await this.store.read(this.key)
@@ -535,9 +661,23 @@ export class OssCredentialProvider extends CredentialProvider {
     }
   }
 
+  /** Set while the exclusive section runs, so a nested step joins it instead of queueing behind it. */
+  private exclusive = false
+
   /** Queue one exclusive operation behind every earlier one. */
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const task = this.operations.then(operation)
+    // A step the running operation awaits — a refresh reconciling a connection
+    // change, whose move is itself exclusive — must run inline: queueing it
+    // would wait for the very operation that is waiting for it.
+    if (this.exclusive) return operation()
+    const task = this.operations.then(async () => {
+      this.exclusive = true
+      try {
+        return await operation()
+      } finally {
+        this.exclusive = false
+      }
+    })
     this.operations = task.then(() => undefined, () => undefined)
     return task
   }

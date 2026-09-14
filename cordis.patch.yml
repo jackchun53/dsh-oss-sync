@@ -8,8 +8,14 @@
 # providers on their own ids.
 #
 # Values come from the launching environment so one installed bundle serves
-# every machine; set them in the shell, in the profile's `cordis.patch.yml`,
-# or in a `.env` the launcher reads.
+# every machine; set them in the shell or in the profile's `cordis.patch.yml`.
+# None of them is a precondition for booting: an empty `bucket` starts the
+# providers local-only, and the settings card is where a connection is supplied
+# (every surface, including Desktop, launches without one).
+#
+# A `.env` is not a route for these names: the launcher treats every `DSH_*`
+# variable as launch-environment-only and refuses one that a discovered file
+# tries to set.
 
 - id: settings
   disabled: true
@@ -24,7 +30,9 @@
     - id: oss-settings
       name: 'dsh-oss-sync'
       config:
-        bucket: !!js process.env.DSH_SYNC_BUCKET
+        # Empty is the local-only start: the seam is served from this machine's
+        # document until the card saves a bucket.
+        bucket: !!js process.env.DSH_SYNC_BUCKET ?? ''
         endpoint: !!js process.env.DSH_SYNC_ENDPOINT
         region: !!js process.env.DSH_SYNC_REGION ?? 'us-east-1'
         prefix: !!js process.env.DSH_SYNC_PREFIX ?? 'dsh-sync'
@@ -33,7 +41,7 @@
     - id: oss-credentials
       name: 'dsh-oss-sync/credentials'
       config:
-        bucket: !!js process.env.DSH_SYNC_BUCKET
+        bucket: !!js process.env.DSH_SYNC_BUCKET ?? ''
         endpoint: !!js process.env.DSH_SYNC_ENDPOINT
         region: !!js process.env.DSH_SYNC_REGION ?? 'us-east-1'
         prefix: !!js process.env.DSH_SYNC_PREFIX ?? 'dsh-sync'

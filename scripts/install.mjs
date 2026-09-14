@@ -25,8 +25,8 @@ const PACKAGE_NAME = JSON.parse(readFileSync(join(PACKAGE_DIR, 'package.json'), 
 /** Profile the web UI boots from, and the one this plugin's card lives behind. */
 const DEFAULT_PROFILES = ['web']
 
-/** Environment variables the providers read; the script reports what is missing. */
-const REQUIRED_ENV = ['DSH_SYNC_BUCKET']
+/** Environment variables the providers read; the script reports which are in force. */
+const BUCKET_ENV = 'DSH_SYNC_BUCKET'
 const OPTIONAL_ENV = [
   'DSH_SYNC_ENDPOINT',
   'DSH_SYNC_REGION',
@@ -182,11 +182,11 @@ function verify(launcher, profile, options) {
 
 /** Report the environment the providers read. */
 function reportEnvironment() {
-  const missing = REQUIRED_ENV.filter(name => (process.env[name] ?? '').length === 0)
+  const bucket = (process.env[BUCKET_ENV] ?? '').length > 0
   const set = OPTIONAL_ENV.filter(name => (process.env[name] ?? '').length > 0)
   console.log('\nEnvironment (read at launch, by every machine):')
-  if (missing.length > 0) console.log(`  ! not set: ${missing.join(', ')}`)
-  console.log(`  ${REQUIRED_ENV[0]}=<bucket>${set.length === 0 ? '' : `   (also set: ${set.join(', ')})`}`)
+  console.log(`  ${BUCKET_ENV}=<bucket>${bucket ? '' : '   (not set: the providers start local-only; set it here or in Settings → Plugins)'}`)
+  console.log(`  DSH_SYNC_ENDPOINT / DSH_SYNC_REGION / DSH_SYNC_PREFIX / DSH_SYNC_POLL_MS, or the settings card${set.length === 0 ? '' : `   (already set: ${set.join(', ')})`}`)
   console.log('  DSH_SYNC_ACCESS_KEY_ID / DSH_SYNC_SECRET_ACCESS_KEY, or the AWS SDK chain')
 }
 

@@ -32,6 +32,8 @@ export declare class OssSettingsProvider extends SettingsProvider {
     static Config: z<Config>;
     /** Parameters the entry config supplies; the namespace overrides them. */
     private readonly bootstrap;
+    /** The bucket credentials this machine saved from the settings page, if any. */
+    private connection;
     private readonly state;
     /** Parameters in force now. */
     private spec;
@@ -69,6 +71,12 @@ export declare class OssSettingsProvider extends SettingsProvider {
      */
     protected load(): Promise<Record<string, unknown>>;
     /**
+     * This machine's own copy of the document: what a start without a bucket and
+     * an unreachable bucket both fall back to.
+     * @returns the cached document, or `undefined` while this machine has none.
+     */
+    private loadCache;
+    /**
      * Store one namespace's next user section.
      *
      * The write re-reads the object, keeps every section the newer revision
@@ -78,6 +86,35 @@ export declare class OssSettingsProvider extends SettingsProvider {
      * winner's document rather than overwriting it.
      */
     protected persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void>;
+    /**
+     * Commit one edit without storage, for the machine that has no bucket yet.
+     *
+     * The seam is what the page configures the connection through, so it has to
+     * work before a connection exists: the document stays in memory and in the
+     * cache, and the first bucket saved here seeds it to that location.
+     * @param ns - the namespace being written.
+     * @param section - the section as the seam holds it, runtime fields included.
+     * @param stored - the section narrowed to what storage would keep.
+     */
+    private commitLocally;
+    /**
+     * Put this machine's saved bucket credentials in force, before the first read.
+     *
+     * They are deliberately local: reading the document is what needs them, so
+     * they cannot live in it. A hand-edited half pair is ignored rather than
+     * fatal — the entry config still applies and the card can repair it.
+     */
+    private adoptStoredConnection;
+    /** The composition layer the sync namespace resolves over. */
+    private baseLayer;
+    /**
+     * Keep this machine's copy of the bucket credentials in step with the page.
+     *
+     * A half-filled pair is left alone until the save is complete, so the store
+     * is never rebuilt around half a credential.
+     * @param section - the merged user section as the seam holds it.
+     */
+    private syncStoredConnection;
     [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void>;
     /** The coordination handle the credentials provider joins. */
     private createControl;
@@ -86,6 +123,21 @@ export declare class OssSettingsProvider extends SettingsProvider {
      * any connection parameter the user changed.
      */
     private onSettings;
+    /**
+     * Report a bucket this process cannot use yet.
+     * @returns the failure's text, or `undefined` when storage preflight passed
+     *   (including the local-only start, which contacts nothing).
+     */
+    private preflight;
+    /**
+     * Adopt the settings the page resolved. A connection the page asked for may
+     * be unreachable or lack credentials; that is a status line the card shows,
+     * never a reason to take the host or the page down.
+     * @param next - the namespace value as the seam resolved it.
+     */
+    private reconcileOrReport;
+    /** Poll only while a bucket is configured; a cleared bucket suspends the loop. */
+    private applyPoll;
     /** Run the verb a card asked for on this provider and every participant. */
     private runRequested;
     /**
@@ -97,8 +149,29 @@ export declare class OssSettingsProvider extends SettingsProvider {
     private reconcile;
     /** Move both documents' home to the parameters the settings page asked for. */
     private relocate;
+    /**
+     * Move every participant to the location this provider just adopted.
+     *
+     * The credentials half follows the same namespace, and the seam offers no
+     * cross-namespace observer, so without this poke a connection saved on the
+     * page would reach the settings document now and the credential document
+     * only at the next poll — or never, while the local-only start has the poll
+     * suspended.
+     */
+    private follow;
     /** Adopt one stored revision as this process's document. */
     private adopt;
+    /**
+     * Adopt a document that came from storage, keeping the fields that only ever
+     * live here.
+     *
+     * Storage never carries this machine's bucket credentials, so a poll that
+     * overwrote the seam with the stored document would erase the pair the page
+     * saved — and the next reconcile would then lose the connection with it.
+     * @param document - the document as stored.
+     * @returns the document the seam holds.
+     */
+    private withLocalFields;
     /** Publish the seam's document with the runtime status merged in. */
     private publishDocument;
     /** Merge one participant's status and republish the namespace. */
@@ -111,6 +184,8 @@ export declare class OssSettingsProvider extends SettingsProvider {
     private push;
     /** Read storage once and publish a revision this process did not commit. */
     private refresh;
+    /** Set while the exclusive section runs, so a nested step joins it instead of queueing behind it. */
+    private exclusive;
     /** Queue one exclusive operation behind every earlier one. */
     private enqueue;
 }

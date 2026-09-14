@@ -14,11 +14,17 @@
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
+import type { StoredConnection } from './envelope.js'
 
 /** Entry config: the bootstrap values a cold start needs. */
 export interface Config {
-  /** Bucket holding the synced documents. */
-  bucket: string
+  /**
+   * Bucket holding the synced documents. Absent means "not configured yet":
+   * the providers run local-only — every namespace still resolves from this
+   * machine's document, nothing is read or written to a service — so the
+   * settings card is reachable to supply one.
+   */
+  bucket?: string
   /** Endpoint of an S3-compatible service (MinIO, Ceph, COS); omit for AWS itself. */
   endpoint?: string
   /** Region sent with every request; a gateway that ignores regions still needs one. */
@@ -33,13 +39,20 @@ export interface Config {
   secretAccessKeyEnv?: string
   /** Milliseconds between polls for another machine's committed writes. */
   pollMs?: number
+  /**
+   * Access key id for the bucket, as this machine typed it. Local-only: it is
+   * never written to the bucket, which could not be read without it.
+   */
+  accessKeyId?: string
+  /** Secret access key for the bucket, kept on this machine like {@link Config.accessKeyId}. */
+  secretAccessKey?: string
   /** Directory holding the device id and the offline read cache. */
   stateDir?: string
 }
 
 /** Schemastery schema for {@link Config}; the loader validates entry config against it. */
 export const ConfigSchema: z<Config> = z.object({
-  bucket: z.string().required(),
+  bucket: z.string().default(''),
   endpoint: z.string(),
   region: z.string().default('us-east-1'),
   prefix: z.string().default('dsh-sync'),
@@ -47,6 +60,8 @@ export const ConfigSchema: z<Config> = z.object({
   accessKeyIdEnv: z.string().default('DSH_SYNC_ACCESS_KEY_ID'),
   secretAccessKeyEnv: z.string().default('DSH_SYNC_SECRET_ACCESS_KEY'),
   pollMs: z.number().min(1000).default(30_000),
+  accessKeyId: z.string(),
+  secretAccessKey: z.string(),
   stateDir: z.string(),
 })
 
@@ -59,6 +74,8 @@ export interface SpecOverrides {
   forcePathStyle?: boolean
   accessKeyIdEnv?: string
   secretAccessKeyEnv?: string
+  accessKeyId?: string
+  secretAccessKey?: string
   pollMs?: number
 }
 
@@ -71,8 +88,20 @@ export interface ResolvedConfig {
   forcePathStyle: boolean
   accessKeyIdEnv: string
   secretAccessKeyEnv: string
+  accessKeyId?: string
+  secretAccessKey?: string
   pollMs: number
   stateDir: string
+}
+
+/**
+ * Normalize a connection field that the settings page may clear by emptying it:
+ * an empty string is how a text input says "none", not a credential.
+ * @param value - the field as configured or stored.
+ * @returns the value, or `undefined` when it addresses nothing.
+ */
+function clearable(value: string | undefined): string | undefined {
+  return value === undefined || value.length === 0 ? undefined : value
 }
 
 /**
@@ -94,8 +123,10 @@ export function resolveDshHome(): string {
  */
 export function resolveConfig(config: Config): ResolvedConfig {
   const stateDir = config.stateDir ?? join(resolveDshHome(), '.dsh-oss-sync')
+  const accessKeyId = clearable(config.accessKeyId)
+  const secretAccessKey = clearable(config.secretAccessKey)
   return {
-    bucket: config.bucket,
+    bucket: config.bucket ?? '',
     ...config.endpoint === undefined ? {} : { endpoint: config.endpoint },
     region: config.region ?? 'us-east-1',
     prefix: (config.prefix ?? 'dsh-sync').replace(/\/+$/u, ''),
@@ -103,6 +134,8 @@ export function resolveConfig(config: Config): ResolvedConfig {
     accessKeyIdEnv: config.accessKeyIdEnv ?? 'DSH_SYNC_ACCESS_KEY_ID',
     secretAccessKeyEnv: config.secretAccessKeyEnv ?? 'DSH_SYNC_SECRET_ACCESS_KEY',
     pollMs: config.pollMs ?? 30_000,
+    ...accessKeyId === undefined ? {} : { accessKeyId },
+    ...secretAccessKey === undefined ? {} : { secretAccessKey },
     stateDir: isAbsolute(stateDir) ? stateDir : resolve(stateDir),
   }
 }
@@ -116,6 +149,8 @@ export function resolveConfig(config: Config): ResolvedConfig {
 export function applyOverrides(base: ResolvedConfig, overrides: SpecOverrides | undefined): ResolvedConfig {
   if (overrides === undefined) return base
   const prefix = overrides.prefix ?? base.prefix
+  const accessKeyId = clearable(overrides.accessKeyId ?? base.accessKeyId)
+  const secretAccessKey = clearable(overrides.secretAccessKey ?? base.secretAccessKey)
   return {
     bucket: overrides.bucket ?? base.bucket,
     ...(overrides.endpoint ?? base.endpoint) === undefined ? {} : { endpoint: overrides.endpoint ?? base.endpoint },
@@ -124,8 +159,28 @@ export function applyOverrides(base: ResolvedConfig, overrides: SpecOverrides | 
     forcePathStyle: overrides.forcePathStyle ?? base.forcePathStyle,
     accessKeyIdEnv: overrides.accessKeyIdEnv ?? base.accessKeyIdEnv,
     secretAccessKeyEnv: overrides.secretAccessKeyEnv ?? base.secretAccessKeyEnv,
+    ...accessKeyId === undefined ? {} : { accessKeyId },
+    ...secretAccessKey === undefined ? {} : { secretAccessKey },
     pollMs: overrides.pollMs ?? base.pollMs,
     stateDir: base.stateDir,
+  }
+}
+
+/**
+ * Fold the credentials the settings page saved on this machine over the entry
+ * config. They are a bootstrap layer: the store needs them before the first
+ * read, which is earlier than any namespace resolves.
+ * @param base - parameters resolved from the entry config and the environment.
+ * @param connection - this machine's stored pair, when it has one.
+ * @returns the parameters a cold start should use.
+ */
+export function mergeConnection(
+  base: ResolvedConfig, connection: StoredConnection | undefined,
+): ResolvedConfig {
+  return {
+    ...base,
+    ...connection?.accessKeyId === undefined ? {} : { accessKeyId: connection.accessKeyId },
+    ...connection?.secretAccessKey === undefined ? {} : { secretAccessKey: connection.secretAccessKey },
   }
 }
 
@@ -142,4 +197,6 @@ export function sameConnection(left: ResolvedConfig, right: ResolvedConfig): boo
     && left.forcePathStyle === right.forcePathStyle
     && left.accessKeyIdEnv === right.accessKeyIdEnv
     && left.secretAccessKeyEnv === right.secretAccessKeyEnv
+    && left.accessKeyId === right.accessKeyId
+    && left.secretAccessKey === right.secretAccessKey
 }

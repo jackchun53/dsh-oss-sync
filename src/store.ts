@@ -50,10 +50,24 @@ function isPreconditionFailed(error: unknown): boolean {
   return candidate?.name === 'PreconditionFailed' || candidate?.$metadata?.httpStatusCode === 412
 }
 
-/** Static credentials when the plugin's own variables are set; otherwise the SDK chain. */
+/**
+ * Static credentials for one connection, most specific source first: the pair
+ * the settings page saved on this machine, then the pair the plugin's own
+ * environment variables name, then (by returning `undefined`) the SDK's chain.
+ * @param config - the parameters in force.
+ * @returns the static pair, or `undefined` to leave the choice to the SDK.
+ * @throws {Error} when exactly half a pair is configured.
+ */
 function resolveStaticCredentials(
   config: ResolvedConfig,
 ): { accessKeyId: string, secretAccessKey: string } | undefined {
+  if (config.accessKeyId !== undefined || config.secretAccessKey !== undefined) {
+    if (config.accessKeyId === undefined || config.secretAccessKey === undefined) {
+      throw new Error('dsh-oss-sync: the connection stores half a credential pair; set both the access key id'
+        + ' and the secret access key, or clear both')
+    }
+    return { accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey }
+  }
   const accessKeyId = process.env[config.accessKeyIdEnv]
   const secretAccessKey = process.env[config.secretAccessKeyEnv]
   if (accessKeyId === undefined || accessKeyId.length === 0) return undefined
@@ -75,7 +89,10 @@ export class ObjectStore {
   private readonly ambient: ReturnType<typeof defaultProvider> | undefined
 
   constructor(private readonly config: ResolvedConfig) {
-    const staticCredentials = resolveStaticCredentials(config)
+    // Nothing is contacted while no bucket is set, so a half-configured
+    // credential pair must not fail the host either: it is reported when the
+    // preflight for a real bucket runs.
+    const staticCredentials = this.configured ? resolveStaticCredentials(config) : undefined
     this.ambient = staticCredentials === undefined ? defaultProvider() : undefined
     const clientConfig: S3ClientConfig = {
       region: config.region,
@@ -87,20 +104,29 @@ export class ObjectStore {
   }
 
   /**
+   * Whether a bucket is set. An unconfigured store is never contacted: reads
+   * and writes refuse it explicitly so a missing guard fails loudly here
+   * rather than as an empty-bucket request.
+   */
+  get configured(): boolean {
+    return this.config.bucket.length > 0
+  }
+
+  /**
    * Resolve the ambient credential chain once, so a host with no credentials
    * fails at load with the variables it should set instead of failing inside
    * whichever write reaches storage first.
    * @throws {Error} naming the variables that are missing.
    */
   async preflight(): Promise<void> {
-    if (this.ambient === undefined) return
+    if (!this.configured || this.ambient === undefined) return
     try {
       await this.ambient()
     } catch (error) {
       throw new Error(
         `dsh-oss-sync: no credentials for bucket "${this.config.bucket}"; set ${this.config.accessKeyIdEnv} and`
-        + ` ${this.config.secretAccessKeyEnv}, or configure the AWS SDK chain (AWS_ACCESS_KEY_ID, a profile, or an`
-        + ` instance role): ${String(error)}`,
+        + ` ${this.config.secretAccessKeyEnv}, save a pair in the OSS Sync settings card, or configure the AWS SDK`
+        + ` chain (AWS_ACCESS_KEY_ID, a profile, or an instance role): ${String(error)}`,
       )
     }
   }
@@ -112,6 +138,7 @@ export class ObjectStore {
    * @throws when the service is unreachable or refuses the request.
    */
   async read(key: string): Promise<RemoteObject | undefined> {
+    if (!this.configured) throw new Error('dsh-oss-sync: no bucket configured; nothing to read from')
     try {
       const response = await this.client.send(new GetObjectCommand({ Bucket: this.config.bucket, Key: key }))
       const text = await response.Body?.transformToString() ?? ''
@@ -131,6 +158,7 @@ export class ObjectStore {
    * @throws {PreconditionFailedError} when the service refused the precondition.
    */
   async write(key: string, text: string, condition: WriteCondition): Promise<{ etag: string }> {
+    if (!this.configured) throw new Error('dsh-oss-sync: no bucket configured; nothing to write to')
     try {
       const response = await this.client.send(new PutObjectCommand({
         Bucket: this.config.bucket,

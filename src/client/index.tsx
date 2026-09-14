@@ -30,18 +30,46 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 /** The settings namespace this card edits; the host half registers it. */
 const NS = 'oss-sync'
 
+/** One editable field of the card. */
+interface FieldSpec {
+  /** Namespace field this input edits. */
+  field: string
+  /** Label above the input. */
+  label: string
+  /** Hint below the input. */
+  hint: string
+  /** Render as a masked input: the value is a secret. */
+  secret?: boolean
+  /** Write an empty string instead of unsetting, so emptying the input clears what is stored. */
+  clearWithEmpty?: boolean
+}
+
 /** Fields the card edits, in render order. */
-const FIELDS = [
-  { field: 'bucket', label: 'Bucket', hint: 'Holds both documents.' },
-  { field: 'endpoint', label: 'Endpoint', hint: 'S3-compatible address; empty means AWS.' },
-  { field: 'prefix', label: 'Key prefix', hint: 'Changing it moves both documents.' },
-  { field: 'region', label: 'Region', hint: 'Signature region.' },
-  { field: 'pollMs', label: 'Poll interval (ms)', hint: 'How fast another machine\'s write arrives.' },
+const FIELDS: readonly FieldSpec[] = [
+  { field: 'bucket', label: '存储桶', hint: '两份文档都存放于此。' },
+  { field: 'endpoint', label: '端点', hint: 'S3 兼容地址；留空表示使用 AWS。' },
+  { field: 'prefix', label: '键前缀', hint: '修改后会移动两份文档。' },
+  { field: 'region', label: '区域', hint: '签名使用的区域。' },
+  { field: 'pollMs', label: '轮询间隔（毫秒）', hint: '另一台机器的写入多久到达本机。' },
+  {
+    field: 'accessKeyId',
+    label: '访问密钥 ID',
+    hint: '只保存在本机，不会写入存储桶。',
+    clearWithEmpty: true,
+  },
+  {
+    field: 'secretAccessKey',
+    label: '访问密钥 Secret',
+    hint: '只保存在本机，不会写入存储桶；清空即删除本机保存的密钥。',
+    secret: true,
+    clearWithEmpty: true,
+  },
 ]
 
 /** One provider's runtime status, as the host publishes it. */
 interface StatusView {
   state?: string
+  configured?: boolean
   revision?: number
   writer?: string
   updatedAt?: string
@@ -201,7 +229,7 @@ class CardController {
     try {
       for (const entry of pending) {
         const text = state.drafts[entry.field] ?? ''
-        if (text.length === 0) await this.scope.unset(entry.field)
+        if (text.length === 0 && entry.clearWithEmpty !== true) await this.scope.unset(entry.field)
         else await this.scope.set(entry.field, entry.field === 'pollMs' ? Number(text) : text)
       }
       const latest = this.snapshot.getSnapshot()
@@ -248,19 +276,27 @@ const ROW: CSSProperties = { display: 'flex', gap: '8px', flexWrap: 'wrap', marg
  */
 function OssSyncCard(props: OssSyncCardProps) {
   const state = props.useOssSyncCard(snapshot => snapshot)
+  // A provider that reports no bucket is local-only, which is the state the
+  // card exists to end: actions have nothing to reach until one is saved.
+  const unconfigured = Object.values(state.status).some(entry => entry.configured === false)
   return (
     <div style={{ border: '1px solid var(--dsh-border, #ddd)', borderRadius: '6px', padding: '12px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-        <strong>OSS Sync</strong>
+        <strong>OSS 同步</strong>
         <span style={HINT}>
-          {state.ready ? (state.writable ? 'writable' : 'read-only') : 'waiting for the host'}
+          {state.ready ? (state.writable ? '可写' : '只读') : '等待宿主'}
         </span>
       </div>
       <p style={{ ...HINT, margin: '4px 0 10px' }}>
-        Settings and credentials are stored in an S3-compatible bucket, so every machine reads the
-        same documents. Changes take effect on the next request; the bucket and endpoint apply
-        immediately.
+        设置与密钥都存放在 S3 兼容的存储桶里，因此每台机器读取同一份文档。改动会在下一次请求时生效；
+        存储桶与端点立即生效。
       </p>
+
+      {unconfigured ? (
+        <p style={{ ...HINT, margin: '0 0 10px' }}>
+          尚未配置存储桶：在保存一个之前，设置与密钥只留在本机。保存时会以本机文档作为初始内容写入。
+        </p>
+      ) : null}
 
       <div style={{ display: 'grid', gap: '8px' }}>
         {FIELDS.map((entry) => {
@@ -269,11 +305,13 @@ function OssSyncCard(props: OssSyncCardProps) {
             <label key={entry.field} htmlFor={`oss-sync-${entry.field}`}>
               <span style={LABEL}>
                 {entry.label}
-                {state.overridden[entry.field] === undefined ? null : <em style={HINT}> (overridden)</em>}
+                {state.overridden[entry.field] === undefined ? null : <em style={HINT}> （已覆盖）</em>}
               </span>
               <input
                 id={`oss-sync-${entry.field}`}
                 style={INPUT}
+                type={entry.secret === true ? 'password' : 'text'}
+                autoComplete={entry.secret === true ? 'new-password' : 'off'}
                 disabled={!state.writable || state.saving}
                 value={draft ?? renderValue(state.values[entry.field])}
                 onChange={(event) => { props.edit(entry.field, event.target.value) }}
@@ -286,16 +324,16 @@ function OssSyncCard(props: OssSyncCardProps) {
 
       <div style={ROW}>
         <button type="button" disabled={!state.dirty || state.saving} onClick={() => { props.save() }}>
-          {state.saving ? 'Saving…' : 'Save'}
+          {state.saving ? '保存中…' : '保存'}
         </button>
         <button type="button" disabled={!state.dirty || state.saving} onClick={() => { props.discard() }}>
-          Discard
+          放弃
         </button>
-        <button type="button" disabled={!state.ready} onClick={() => { props.action('pull') }}>
-          Sync now
+        <button type="button" disabled={!state.ready || unconfigured} onClick={() => { props.action('pull') }}>
+          立即同步
         </button>
-        <button type="button" disabled={!state.ready} onClick={() => { props.action('push') }}>
-          Force push
+        <button type="button" disabled={!state.ready || unconfigured} onClick={() => { props.action('push') }}>
+          强制推送
         </button>
       </div>
 
@@ -305,7 +343,7 @@ function OssSyncCard(props: OssSyncCardProps) {
 
       {(['settings', 'credentials'] as const).map(label => (
         <div key={label} style={{ marginTop: '10px' }}>
-          <span style={LABEL}>{label}</span>
+          <span style={LABEL}>{label === 'settings' ? '设置' : '密钥'}</span>
           <span style={HINT}>
             {describeStatus(state.status[label])}
           </span>
@@ -321,14 +359,15 @@ function OssSyncCard(props: OssSyncCardProps) {
  * @returns the line.
  */
 function describeStatus(status: StatusView | undefined): string {
-  if (status === undefined) return 'no status yet'
+  if (status === undefined) return '暂无状态'
+  if (status.configured === false) return '未配置 · 不读取也不写入'
   const parts = [
-    `state ${status.state ?? 'unknown'}`,
-    `revision ${String(status.revision ?? 0)}`,
-    status.objectKey === undefined ? undefined : `key ${status.objectKey}`,
-    status.lastReadAt === undefined ? undefined : `read ${status.lastReadAt}`,
-    status.lastWriteAt === undefined ? undefined : `wrote ${status.lastWriteAt}`,
-    status.lastError === undefined ? undefined : `error ${status.lastError}`,
+    `状态 ${status.state === 'error' ? '错误' : '正常'}`,
+    `版本 ${String(status.revision ?? 0)}`,
+    status.objectKey === undefined ? undefined : `对象 ${status.objectKey}`,
+    status.lastReadAt === undefined ? undefined : `读取 ${status.lastReadAt}`,
+    status.lastWriteAt === undefined ? undefined : `写入 ${status.lastWriteAt}`,
+    status.lastError === undefined ? undefined : `错误 ${status.lastError}`,
   ]
   return parts.filter(part => part !== undefined).join(' · ')
 }

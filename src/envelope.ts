@@ -8,12 +8,28 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 
 /** Wire version this plugin writes and accepts; an unknown version is refused. */
 export const ENVELOPE_VERSION = 1
+
+/** File holding this machine's own bucket credentials, never synced. */
+const CONNECTION_FILE = 'connection.yaml'
+
+/**
+ * The bucket's own credentials, held on the machine that typed them.
+ *
+ * They are deliberately outside the document: a machine needs them to read the
+ * document at all, so putting them in the bucket would be a circle.
+ */
+export interface StoredConnection {
+  /** Access key id for the bucket. */
+  accessKeyId?: string
+  /** Secret access key for the bucket. */
+  secretAccessKey?: string
+}
 
 /** One synced document with the facts a concurrent writer needs. */
 export interface Envelope<T> {
@@ -81,6 +97,56 @@ export class SyncState {
   private device: string | undefined
 
   constructor(private readonly dir: string) {}
+
+  /**
+   * Read the connection credentials the settings page saved on this machine.
+   *
+   * They are the one thing that cannot travel in the document: reading the
+   * document needs them. The file stays on this machine at mode 0600 and is
+   * never part of what syncs.
+   * @returns the stored pair, or `undefined` while this machine holds none.
+   */
+  async readConnection(): Promise<StoredConnection | undefined> {
+    let root: unknown
+    try {
+      root = parseYaml(await readFile(this.connectionPath(), 'utf8'))
+    } catch {
+      // Absence, or a file this plugin did not write, is "no local pair": the
+      // environment and the SDK chain still apply.
+      return undefined
+    }
+    if (typeof root !== 'object' || root === null || Array.isArray(root)) return undefined
+    const candidate = root as StoredConnection
+    const text = (field: unknown): string | undefined =>
+      typeof field === 'string' && field.length > 0 ? field : undefined
+    const connection: StoredConnection = {
+      accessKeyId: text(candidate.accessKeyId),
+      secretAccessKey: text(candidate.secretAccessKey),
+    }
+    return connection.accessKeyId === undefined && connection.secretAccessKey === undefined
+      ? undefined
+      : connection
+  }
+
+  /**
+   * Replace this machine's copy, or remove the file when the page cleared both.
+   * @param connection - the pair to store; omitting one, or both, is a clear.
+   */
+  async writeConnection(connection: StoredConnection = {}): Promise<void> {
+    if (connection.accessKeyId === undefined && connection.secretAccessKey === undefined) {
+      await rm(this.connectionPath(), { force: true })
+      return
+    }
+    await mkdir(this.dir, { recursive: true })
+    await writeFile(this.connectionPath(), stringifyYaml(connection, { lineWidth: 0 }), {
+      encoding: 'utf8', mode: 0o600,
+    })
+  }
+
+  /** Path of the local connection credentials. */
+  private connectionPath(): string {
+    return join(this.dir, CONNECTION_FILE)
+  }
 
   /**
    * Read this machine's stable device id, creating it on first use. One

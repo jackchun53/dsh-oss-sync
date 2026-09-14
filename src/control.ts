@@ -22,6 +22,12 @@ export const SYNC_NAMESPACE = 'oss-sync'
 export interface SyncStatus {
   /** `idle` after a settled operation, `error` after a failed one. */
   state: 'idle' | 'error'
+  /**
+   * Whether this provider has a bucket to reach. `false` is the local-only
+   * start: every namespace still resolves, nothing is read or written, and the
+   * first bucket the page saves becomes the remote home.
+   */
+  configured: boolean
   /** Revision this provider last read or wrote. */
   revision: number
   /** Device that committed that revision. */
@@ -57,7 +63,7 @@ export interface SyncRuntime {
 
 /** The editable connection settings, as the settings page sees them. */
 export interface SyncSettings extends SyncRuntime {
-  /** Bucket holding the documents; defaults to the entry config. */
+  /** Bucket holding the documents; defaults to the entry config. Empty leaves this machine local-only. */
   bucket?: string
   /** S3-compatible endpoint; defaults to the entry config. */
   endpoint?: string
@@ -73,6 +79,14 @@ export interface SyncSettings extends SyncRuntime {
   accessKeyIdEnv?: string
   /** Environment variable holding the secret access key. */
   secretAccessKeyEnv?: string
+  /**
+   * Access key id for the bucket, typed on the settings page. Kept on this
+   * machine only — a bucket cannot hold the credentials that reading it needs
+   * — and an empty value clears what this machine holds.
+   */
+  accessKeyId?: string
+  /** Secret access key for the bucket, kept on this machine like {@link SyncSettings.accessKeyId}. */
+  secretAccessKey?: string
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -82,17 +96,26 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-/** Runtime facts that never reach storage. */
-const RUNTIME_FIELDS = ['status', 'request'] as const
+/**
+ * The bucket's own credentials: fields that stay on this machine because
+ * storage cannot hold the credentials that reading storage needs.
+ */
+export const LOCAL_CREDENTIAL_FIELDS = ['accessKeyId', 'secretAccessKey'] as const
 
 /**
- * Remove the runtime fields from a namespace section.
+ * Fields that stay on this machine: the runtime facts a provider reports, and
+ * the bucket's own credentials.
+ */
+const LOCAL_FIELDS = ['status', 'request', ...LOCAL_CREDENTIAL_FIELDS] as const
+
+/**
+ * Remove the local-only fields from a namespace section.
  * @param section - the section as the seam holds it.
- * @returns a detached copy carrying only what belongs in the bucket.
+ * @returns a detached copy carrying only what storage should keep.
  */
 export function storedSection(section: Record<string, unknown>): Record<string, unknown> {
   const stored = { ...section }
-  for (const field of RUNTIME_FIELDS) delete stored[field]
+  for (const field of LOCAL_FIELDS) delete stored[field]
   return stored
 }
 
@@ -143,9 +166,9 @@ export interface SyncControl {
 }
 
 /**
- * Strip the runtime fields from a whole document before it is written to
+ * Strip the local-only fields from a whole document before it is written to
  * storage — the seed a provider carries to a new location is the seam's
- * document, which holds the status this process last published.
+ * document, which holds this process's status.
  * @param document - the document as the seam holds it.
  * @returns a detached copy carrying only what belongs in the bucket.
  */

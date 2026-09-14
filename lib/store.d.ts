@@ -40,6 +40,12 @@ export declare class ObjectStore {
     private readonly ambient;
     constructor(config: ResolvedConfig);
     /**
+     * Whether a bucket is set. An unconfigured store is never contacted: reads
+     * and writes refuse it explicitly so a missing guard fails loudly here
+     * rather than as an empty-bucket request.
+     */
+    get configured(): boolean;
+    /**
      * Resolve the ambient credential chain once, so a host with no credentials
      * fails at load with the variables it should set instead of failing inside
      * whichever write reaches storage first.

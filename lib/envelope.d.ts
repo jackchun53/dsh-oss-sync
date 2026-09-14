@@ -8,6 +8,18 @@
  */
 /** Wire version this plugin writes and accepts; an unknown version is refused. */
 export declare const ENVELOPE_VERSION = 1;
+/**
+ * The bucket's own credentials, held on the machine that typed them.
+ *
+ * They are deliberately outside the document: a machine needs them to read the
+ * document at all, so putting them in the bucket would be a circle.
+ */
+export interface StoredConnection {
+    /** Access key id for the bucket. */
+    accessKeyId?: string;
+    /** Secret access key for the bucket. */
+    secretAccessKey?: string;
+}
 /** One synced document with the facts a concurrent writer needs. */
 export interface Envelope<T> {
     /** Wire version. */
@@ -39,6 +51,22 @@ export declare class SyncState {
     private readonly dir;
     private device;
     constructor(dir: string);
+    /**
+     * Read the connection credentials the settings page saved on this machine.
+     *
+     * They are the one thing that cannot travel in the document: reading the
+     * document needs them. The file stays on this machine at mode 0600 and is
+     * never part of what syncs.
+     * @returns the stored pair, or `undefined` while this machine holds none.
+     */
+    readConnection(): Promise<StoredConnection | undefined>;
+    /**
+     * Replace this machine's copy, or remove the file when the page cleared both.
+     * @param connection - the pair to store; omitting one, or both, is a clear.
+     */
+    writeConnection(connection?: StoredConnection): Promise<void>;
+    /** Path of the local connection credentials. */
+    private connectionPath;
     /**
      * Read this machine's stable device id, creating it on first use. One
      * machine keeps one id across every profile and restart, so a poll can tell

@@ -21,6 +21,12 @@ export declare class PollLoop {
      * @param intervalMs - the new interval in milliseconds.
      */
     restart(intervalMs: number): void;
+    /**
+     * Suspend ticks without ending the loop. The providers pause while no bucket
+     * is configured — there is nothing to poll — and {@link start} or
+     * {@link restart} resumes afterwards.
+     */
+    pause(): void;
     /** Arm the timer; separate so a restart reuses the identical callback. */
     private schedule;
     /** Stop polling and wait for the in-flight tick. */
