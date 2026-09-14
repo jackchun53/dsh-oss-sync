@@ -309,6 +309,28 @@ try {
   await waitFor(() => !existsSync(connectionFile), 'clearing the pair to remove the local file')
   console.log('ok  credentials: clearing both fields removes the locally saved pair')
 
+  // The card saves field by field, so the bucket commit's relocation can run
+  // while no credential is stored yet. That attempt must leave the local-only
+  // store in place: swapping to the unreachable one would refuse every later
+  // save at its read, and the pair could never arrive.
+  const racedDir = join(root, 'raced')
+  const raced = await boot(OssSettingsProvider, {
+    ...machineConfig(racedDir),
+    bucket: '',
+    accessKeyIdEnv: 'KEYED_ACCESS_KEY_ID',
+    secretAccessKeyEnv: 'KEYED_SECRET_ACCESS_KEY',
+  })
+  cleanups.push(() => raced.fiber.dispose())
+  const racedStatus = () => raced.ctx.settings.get('oss-sync').status.settings
+  await raced.ctx.settings.update('oss-sync', { bucket: 'test', prefix: 'raced' })
+  await waitFor(() => racedStatus().state === 'error', 'the credential-less relocation to fail')
+  assert.equal(racedStatus().configured, false, 'the failed relocation kept the working store')
+  await raced.ctx.settings.update('oss-sync', { accessKeyId: 'AKIA-LOCAL' })
+  await raced.ctx.settings.update('oss-sync', { secretAccessKey: 'sk-local' })
+  await waitFor(() => service.objects.has('raced/settings.yaml'), 'the saved pair to complete the connection')
+  assert.equal(racedStatus().state, 'idle', `the saved pair repaired the connection: ${String(racedStatus().lastError)}`)
+  console.log('ok  settings: a bucket saved before its credentials still converges')
+
   // ── the status stamp belongs to one provider ────────────────────────────
   // The page saving a bucket must update this provider's line without making
   // another provider's line claim a connection that half has not made.

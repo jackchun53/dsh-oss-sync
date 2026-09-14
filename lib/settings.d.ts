@@ -149,6 +149,8 @@ export declare class OssSettingsProvider extends SettingsProvider {
     private reconcile;
     /** Move both documents' home to the parameters the settings page asked for. */
     private relocate;
+    /** Swap in a relocation target that has proven reachable, releasing the store it replaces. */
+    private adoptRelocation;
     /**
      * Move every participant to the location this provider just adopted.
      *

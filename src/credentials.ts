@@ -459,55 +459,67 @@ export class OssCredentialProvider extends CredentialProvider {
       // Build the replacement before anything is swapped: a store that cannot
       // be built must leave this provider on the connection it still serves.
       const replacement = connectionChanged ? new ObjectStore(desired) : undefined
-      if (replacement !== undefined) this.store.destroy()
-      this.spec = desired
-      this.key = `${desired.prefix}/${OBJECT_NAME}`
-      if (replacement !== undefined) {
-        this.store = replacement
-        if (!this.store.configured) {
+      const target = replacement ?? this.store
+      const nextKey = `${desired.prefix}/${OBJECT_NAME}`
+      try {
+        if (!target.configured) {
           // The page cleared the bucket: keep serving this machine's document
           // and stop reaching for a service until one is set again.
+          this.adoptRelocation(desired, replacement, nextKey)
           this.etag = undefined
           this.applyPoll()
           this.report({ state: 'idle', lastError: undefined })
           return
         }
-        await this.store.preflight()
-      }
-      // The target starts from nothing: read it, and seed it from the document
-      // already in hand when it is empty, so changing the connection carries
-      // the stored credentials instead of appearing to lose them.
-      this.etag = undefined
-      let remote
-      try {
-        remote = await this.store.read(this.key)
+        // The target proves itself before it is adopted — the credential chain
+        // resolves, then the bucket answers a read — so a location this
+        // machine cannot reach leaves the working connection in place.
+        if (replacement !== undefined) await replacement.preflight()
+        const remote = await target.read(nextKey)
+        if (remote === undefined) {
+          // The target starts from nothing: seed it from the document already
+          // in hand, so changing the connection carries the stored
+          // credentials instead of appearing to lose them.
+          const envelope: Envelope<CredentialDocument> = {
+            v: ENVELOPE_VERSION,
+            rev: this.revision + 1,
+            writer: await this.state.deviceId(),
+            updatedAt: new Date().toISOString(),
+            doc: carried,
+          }
+          const written = await target.write(nextKey, encodeEnvelope(envelope), { ifNoneMatch: true })
+          this.adoptRelocation(desired, replacement, nextKey)
+          this.etag = written.etag
+          this.revision = envelope.rev
+          this.local = carried
+          await this.state.writeCache(OBJECT_NAME, envelope)
+          this.ctx.logger.info('dsh-oss-sync: credentials moved to %s and seeded it from this machine', this.key)
+        } else {
+          const envelope = parseEnvelope<CredentialDocument>(remote.text)
+          const doc = asDocument(envelope.doc)
+          this.adoptRelocation(desired, replacement, nextKey)
+          this.etag = remote.etag
+          this.revision = envelope.rev
+          this.local = doc
+          await this.state.writeCache(OBJECT_NAME, { ...envelope, doc })
+          this.ctx.logger.info('dsh-oss-sync: credentials moved to %s and adopted revision %d', this.key, envelope.rev)
+        }
       } catch (error) {
-        this.report({ state: 'error', lastError: String(error), objectKey: this.key })
+        replacement?.destroy()
+        this.report({ state: 'error', lastError: String(error), objectKey: nextKey })
         throw error
       }
-      if (remote === undefined) {
-        const envelope: Envelope<CredentialDocument> = {
-          v: ENVELOPE_VERSION,
-          rev: this.revision + 1,
-          writer: await this.state.deviceId(),
-          updatedAt: new Date().toISOString(),
-          doc: carried,
-        }
-        const written = await this.store.write(this.key, encodeEnvelope(envelope), { ifNoneMatch: true })
-        this.etag = written.etag
-        this.revision = envelope.rev
-        await this.state.writeCache(OBJECT_NAME, envelope)
-        this.local = carried
-        this.ctx.logger.info('dsh-oss-sync: credentials moved to %s and seeded it from this machine', this.key)
-        return
-      }
-      const envelope = parseEnvelope<CredentialDocument>(remote.text)
-      this.etag = remote.etag
-      this.revision = envelope.rev
-      this.local = asDocument(envelope.doc)
-      await this.state.writeCache(OBJECT_NAME, envelope)
-      this.ctx.logger.info('dsh-oss-sync: credentials moved to %s and adopted revision %d', this.key, envelope.rev)
     })
+  }
+
+  /** Swap in a relocation target that has proven reachable, releasing the store it replaces. */
+  private adoptRelocation(desired: ResolvedConfig, replacement: ObjectStore | undefined, nextKey: string): void {
+    if (replacement !== undefined) {
+      this.store.destroy()
+      this.store = replacement
+    }
+    this.spec = desired
+    this.key = nextKey
   }
 
   /** Merge this provider's status into the published sync namespace. */

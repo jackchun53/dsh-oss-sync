@@ -157,6 +157,8 @@ export declare class OssCredentialProvider extends CredentialProvider {
     private reconcile;
     /** Move this provider's document home to the parameters the page asked for. */
     private relocate;
+    /** Swap in a relocation target that has proven reachable, releasing the store it replaces. */
+    private adoptRelocation;
     /** Merge this provider's status into the published sync namespace. */
     private report;
     /**
