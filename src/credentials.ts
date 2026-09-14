@@ -509,6 +509,9 @@ export class OssCredentialProvider extends CredentialProvider {
         this.report({ state: 'error', lastError: String(error), objectKey: nextKey })
         throw error
       }
+      // A boot that started local-only left the loop paused; a move that just
+      // landed is exactly when polling must begin.
+      this.applyPoll()
     })
   }
 
