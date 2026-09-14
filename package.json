@@ -6,6 +6,10 @@
   "type": "module",
   "main": "lib/index.js",
   "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
     "./settings": {
       "types": "./lib/settings.d.ts",
       "default": "./lib/settings.js"
@@ -14,7 +18,10 @@
       "types": "./lib/credentials.d.ts",
       "default": "./lib/credentials.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": {
+      "default": "./lib/client.js"
+    }
   },
   "files": [
     "lib",
@@ -22,7 +29,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\"",
     "install:profiles": "node scripts/install.mjs",
@@ -45,11 +52,21 @@
     "@deepseek-ai/dsh-settings": "link:../deepseek-harness/packages/settings/settings",
     "@deepseek-ai/schemastery": "link:../deepseek-harness/vendor/schemastery",
     "@types/node": "^22.19.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "@types/react": "^19.2.0",
+    "react": "^19.2.0",
+    "esbuild": "^0.25.0"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
     }
   }
 }

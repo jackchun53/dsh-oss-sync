@@ -41,7 +41,11 @@ export type SyncStatusMap = Record<string, SyncStatus>;
 export interface SyncRuntime {
     /** Status each provider last reported. */
     status?: SyncStatusMap;
-    /** A card's sync request; any change to this value runs every refresher. */
+    /**
+     * A card's sync request, written as `<verb>:<token>`; any change to this
+     * value runs the verb on every provider. `pull` adopts the stored revision;
+     * `push` re-commits this machine's document.
+     */
     request?: string;
 }
 /** The editable connection settings, as the settings page sees them. */
@@ -80,9 +84,19 @@ export declare function storedSection(section: Record<string, unknown>): Record<
  * provider's status goes.
  */
 export interface SyncParticipant {
-    /** Run one refresh on request, bypassing the poll interval. */
+    /** Adopt the stored revision now, bypassing the poll interval. */
     refresh: () => Promise<void>;
+    /** Re-commit this provider's document now. */
+    push: () => Promise<void>;
 }
+/** The verbs a request token may name. */
+export type SyncVerb = 'pull' | 'push';
+/**
+ * Read the verb out of a request token.
+ * @param request - the token a card wrote.
+ * @returns the verb, defaulting to `pull` for a token that names none.
+ */
+export declare function requestVerb(request: string): SyncVerb;
 /**
  * Coordination between the two providers and the status they publish.
  *

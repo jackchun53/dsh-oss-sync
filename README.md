@@ -217,12 +217,10 @@ synced document: it is the bootstrap credential.
 
 ## Known limitations
 
-- **The settings page card is not written yet.** The host half is complete and
-  verified: the namespace is served, status is live, and a request token runs
-  a sync. What is missing is the browser half — a client bundle registered
-  under `settings.plugin.item` for the `oss-sync` key. Until it exists, the
-  Plugins page renders nothing for this namespace, and the fields above are
-  edited by writing `settings.yaml` in the bucket directly.
+- **The settings page card is not verified on screen.** The browser half
+  exists, is discovered, is served, and evaluates without error — but no run
+  has yet opened Settings → Plugins and seen the card render, so treat its
+  layout as unproven. The host half behind it is covered by the smoke test.
 - **No `.env` fallback.** `dsh-credentials-local` layers the process
   environment, the stored file, `<cwd>/.env`, and `$DSH_HOME/.env`. This
   provider layers the environment and the bucket only. Put values that used to
@@ -244,8 +242,20 @@ synced document: it is the bootstrap credential.
 
 ```sh
 pnpm install
-pnpm build          # tsc → lib/
+pnpm build          # tsc → lib/, then esbuild → lib/client.js
+pnpm smoke          # fake-S3 end-to-end checks
 ```
+
+Two build details are not obvious. The package root (`lib/index.js`) is the
+settings provider rather than a subpath entry, because the browser module scan
+resolves a package's `dsh.client` bundle from a Loader row named by a **bare
+package specifier** — a row named `dsh-oss-sync/settings` is permanently not a
+client row. And `lib/client.js` is not an ES module: the combo route
+concatenates several packages into one script, so a top-level `import` in any
+one of them is invalid at that position and breaks the whole script. The bundle
+is therefore a lazy CommonJS factory wrapped in
+`window.__ModuleLoader__.load({ id, factory })`, produced by
+`scripts/build-client.mjs`.
 
 `tsconfig.json` resolves the `@deepseek-ai/*` peer packages through `paths`
 into the sibling `deepseek-harness` checkout's built declarations. Change the

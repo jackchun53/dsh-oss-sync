@@ -22,7 +22,7 @@ import {
   ConfigSchema, applyOverrides, resolveConfig, sameConnection, type Config, type ResolvedConfig,
 } from './config.js'
 import {
-  SYNC_NAMESPACE, storedDocument, storedSection, type SyncControl, type SyncParticipant, type SyncSettings,
+  SYNC_NAMESPACE, requestVerb, storedDocument, storedSection, type SyncControl, type SyncParticipant, type SyncSettings,
   type SyncStatus, type SyncStatusMap,
 } from './control.js'
 import { ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope } from './envelope.js'
@@ -261,19 +261,22 @@ export class OssSettingsProvider extends SettingsProvider {
   private async onSettings(next: SyncSettings): Promise<void> {
     if (next.request !== undefined && next.request !== this.handled) {
       this.handled = next.request
-      await this.runRequested()
+      await this.runRequested(next.request)
       return
     }
     await this.reconcile(next)
   }
 
-  /** Run this provider's and every participant's refresh, as one card gesture. */
-  private async runRequested(): Promise<void> {
-    this.ctx.logger.info('dsh-oss-sync: sync requested from the settings page')
-    await Promise.allSettled([
-      this.refresh(),
-      ...[...this.participants.values()].map(participant => participant.refresh()),
-    ])
+  /** Run the verb a card asked for on this provider and every participant. */
+  private async runRequested(request: string): Promise<void> {
+    const verb = requestVerb(request)
+    this.ctx.logger.info('dsh-oss-sync: %s requested from the settings page', verb)
+    const participants = [...this.participants.values()]
+    if (verb === 'push') {
+      await Promise.allSettled([this.push(), ...participants.map(participant => participant.push())])
+      return
+    }
+    await Promise.allSettled([this.refresh(), ...participants.map(participant => participant.refresh())])
   }
 
   /**
@@ -370,6 +373,38 @@ export class OssSettingsProvider extends SettingsProvider {
       ...patch,
     }
     if (!this.closed) this.publishDocument()
+  }
+
+  /**
+   * Re-commit this machine's document, which is what a `push` request asks
+   * for. The write keeps the same precondition as any other, so a remote that
+   * moved first wins and this machine reports the pull instead of erasing it.
+   */
+  private async push(): Promise<void> {
+    const document = storedDocument(this.local)
+    await this.enqueue(async () => {
+      const remote = await this.store.read(this.key)
+      const envelope: Envelope<SettingsDocument> = {
+        v: ENVELOPE_VERSION,
+        rev: (remote === undefined ? this.revision : parseEnvelope<SettingsDocument>(remote.text).rev) + 1,
+        writer: await this.state.deviceId(),
+        updatedAt: new Date().toISOString(),
+        doc: document,
+      }
+      try {
+        const written = await this.store.write(this.key, encodeEnvelope(envelope), remote === undefined
+          ? { ifNoneMatch: true }
+          : { ifMatch: remote.etag })
+        this.etag = written.etag
+        this.revision = envelope.rev
+        await this.state.writeCache(OBJECT_NAME, envelope)
+        this.report(STATUS_LABEL, { state: 'idle', revision: envelope.rev, lastWriteAt: envelope.updatedAt })
+      } catch (error) {
+        if (!(error instanceof PreconditionFailedError)) throw error
+        this.ctx.logger.warn('dsh-oss-sync: %s moved while pushing; adopting the stored revision', this.key)
+        await this.refresh()
+      }
+    })
   }
 
   /** Read storage once and publish a revision this process did not commit. */

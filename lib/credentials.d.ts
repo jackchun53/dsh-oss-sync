@@ -113,6 +113,12 @@ export declare class OssCredentialProvider extends CredentialProvider {
      */
     private load;
     [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void>;
+    /**
+     * Re-commit this machine's document, which is what a `push` request asks
+     * for. The write keeps the same precondition as any other, so a remote that
+     * moved first wins and this machine reports the pull instead of erasing it.
+     */
+    private push;
     /** The `oss-sync` namespace value, when the settings half serves it. */
     private settings;
     /**

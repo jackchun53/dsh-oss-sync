@@ -18,8 +18,11 @@
   disabled: true
 
 - insert:
+    # Named by the bare package specifier: the browser module scan resolves a
+    # package's dsh.client bundle from a Loader row named exactly this way, and
+    # a row named by a subpath is permanently not a client row.
     - id: oss-settings
-      name: 'dsh-oss-sync/settings'
+      name: 'dsh-oss-sync'
       config:
         bucket: !!js process.env.DSH_SYNC_BUCKET
         endpoint: !!js process.env.DSH_SYNC_ENDPOINT

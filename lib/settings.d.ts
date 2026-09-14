@@ -86,7 +86,7 @@ export declare class OssSettingsProvider extends SettingsProvider {
      * any connection parameter the user changed.
      */
     private onSettings;
-    /** Run this provider's and every participant's refresh, as one card gesture. */
+    /** Run the verb a card asked for on this provider and every participant. */
     private runRequested;
     /**
      * Adopt the parameters the namespace now resolves to. A poll interval
@@ -103,6 +103,12 @@ export declare class OssSettingsProvider extends SettingsProvider {
     private publishDocument;
     /** Merge one participant's status and republish the namespace. */
     private report;
+    /**
+     * Re-commit this machine's document, which is what a `push` request asks
+     * for. The write keeps the same precondition as any other, so a remote that
+     * moved first wins and this machine reports the pull instead of erasing it.
+     */
+    private push;
     /** Read storage once and publish a revision this process did not commit. */
     private refresh;
     /** Queue one exclusive operation behind every earlier one. */
