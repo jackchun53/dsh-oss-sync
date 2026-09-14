@@ -1,0 +1,63 @@
+/**
+ * The revision envelope every synced object carries, plus the two pieces of
+ * per-machine state a conditional writer needs: a stable device id, and a
+ * cache of the last document read so an offline launch still starts from the
+ * configuration this machine last saw.
+ *
+ * @module dsh-oss-sync/envelope
+ */
+/** Wire version this plugin writes and accepts; an unknown version is refused. */
+export declare const ENVELOPE_VERSION = 1;
+/** One synced document with the facts a concurrent writer needs. */
+export interface Envelope<T> {
+    /** Wire version. */
+    v: number;
+    /** Monotonic revision, incremented by whichever machine commits. */
+    rev: number;
+    /** Device that committed this revision, so a poll can recognise its own write. */
+    writer: string;
+    /** ISO timestamp of the commit, for humans reading the bucket. */
+    updatedAt: string;
+    /** The document itself. */
+    doc: T;
+}
+/**
+ * Serialize one envelope as YAML so the bucket stays readable and diffable.
+ * @param envelope - the envelope to write.
+ * @returns the object text.
+ */
+export declare function encodeEnvelope<T>(envelope: Envelope<T>): string;
+/**
+ * Parse one object read back into an envelope.
+ * @param text - the object text.
+ * @returns the parsed envelope.
+ * @throws {Error} when the document is not an envelope this plugin understands.
+ */
+export declare function parseEnvelope<T>(text: string): Envelope<T>;
+/** Per-machine state under the configured state directory. */
+export declare class SyncState {
+    private readonly dir;
+    private device;
+    constructor(dir: string);
+    /**
+     * Read this machine's stable device id, creating it on first use. One
+     * machine keeps one id across every profile and restart, so a poll can tell
+     * its own committed revision from another machine's.
+     * @returns the device id.
+     */
+    deviceId(): Promise<string>;
+    /**
+     * Read the cached envelope for one object.
+     * @param name - object name inside the prefix (`settings.yaml`).
+     * @returns the cached envelope, or `undefined` while none is cached.
+     */
+    readCache<T>(name: string): Promise<Envelope<T> | undefined>;
+    /**
+     * Replace the cached envelope for one object.
+     * @param name - object name inside the prefix.
+     * @param envelope - the envelope last read from or written to storage.
+     */
+    writeCache<T>(name: string, envelope: Envelope<T>): Promise<void>;
+    /** Cache path for one object; the prefix is already part of the configured directory. */
+    private cachePath;
+}
