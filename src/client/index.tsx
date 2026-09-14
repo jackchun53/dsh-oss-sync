@@ -360,7 +360,14 @@ function OssSyncCard(props: OssSyncCardProps) {
  */
 function describeStatus(status: StatusView | undefined): string {
   if (status === undefined) return '暂无状态'
-  if (status.configured === false) return '未配置 · 不读取也不写入'
+  // An unconfigured store can still carry a failure: a relocation that could
+  // not reach its bucket keeps the previous store, and the saved connection's
+  // error is the thing the reader needs.
+  if (status.configured === false) {
+    return status.lastError === undefined
+      ? '未配置 · 不读取也不写入'
+      : `未配置 · 不读取也不写入 · 错误 ${status.lastError}`
+  }
   const parts = [
     `状态 ${status.state === 'error' ? '错误' : '正常'}`,
     `版本 ${String(status.revision ?? 0)}`,
