@@ -102,13 +102,23 @@ a package's `dsh.client` bundle from a Loader row named by a **bare package
 specifier**; a row named `dsh-oss-sync/settings` is permanently not a client
 row. Only the credentials row carries a subpath.
 
+**A new import in the browser half has to be a seeded word.** Externals are the
+shell's frozen module table (`packages/client/web/src/seed.ts`: React and its
+JSX runtime, cordis, the store, and the slots, primitives, and dockkit
+packages), and the factory's `require` resolves against exactly that table —
+anything else throws at materialization, in the browser, with no build-time
+warning. Adding `@deepseek-ai/dsh-client-ui-primitives` to the card is what makes
+the disclosure header share the Host's own chevron and tag; `pnpm test:card`
+fails if a require ever leaves the table, and `tsconfig.client.json` needs a
+`paths` entry per added package so the half still type-checks.
+
 `tsconfig.json` resolves the `@deepseek-ai/*` peer packages through `paths`
 into a sibling `deepseek-harness` checkout's built declarations
 (`lib/types/*.d.ts`), so that checkout has to be built
 (`pnpm install && pnpm run build:lib:host`) before this one compiles. Change the
-sibling path there, or add real dependencies, before publishing. Note that the
-client half also type-checks against the harness's client packages, which is
-why `tsconfig.client.json` lists `ui-slots`, `ui-settings`,
+sibling path there, or add real dependencies, before publishing. The client half
+also type-checks against the harness's client packages, which is why
+`tsconfig.client.json` lists `ui-slots`, `ui-primitives`, `ui-settings`,
 `ui-settings-plugins`, and `ui-renderer` as well.
 
 `lib/` is what the loader loads: rebuild after every source change, then restart
@@ -142,6 +152,16 @@ survives, the changed entry's integrity is restated while the untouched ones are
 left alone, the `.bak` is the original, a second run is a no-op, and a target-free
 archive is refused without leaving a backup beside it.
 
+`pnpm test:card` materializes `lib/client.js` the way the shell does — through
+`window.__ModuleLoader__`, against a table of the nine seeded words, with a React
+stand-in carrying the three hooks the card calls — and drives the card from the
+element records that produces: collapsed on arrival, fields and controls on open,
+a staged edit marked on the header and surviving a collapse, a Host-confirmed
+save closing it again, and an unconfigured or read-only deployment legible
+without opening it. It needs no DOM and no browser, and it fails if a require
+leaves the shell's module table — the mistake a new import in the browser half is
+most likely to make.
+
 ## Layout
 
 ```
@@ -149,6 +169,7 @@ src/            host half; lib/index.js is the settings provider
 src/client/     browser half; single file, bundled to lib/client.js
 cordis.patch.yml  disables the two base rows and inserts this plugin's
 scripts/        build-client.mjs, install.mjs, patch-desktop-asar.mjs
-test/           fake S3, the smoke checks, and the app.asar patcher round trip
+test/           fake S3, the smoke checks, the card checks, and the app.asar
+                patcher round trip
 lib/            committed build output — the published tarball carries it
 ```

@@ -229,6 +229,14 @@ namespace (`oss-sync`), because the seam already carries live values to the
 browser: a namespace re-resolves on every commit and the client mirror forwards
 it. No second channel was needed.
 
+The card arrives collapsed. `Settings → Plugins` is a list of one row per plugin,
+so the header names this one, says what its settings govern, and carries the
+state a reader needs without opening it: `仅本机` until a bucket is saved, `只读`
+where the deployment is not writable, `等待宿主` before the Host has answered, and
+`未保存` while an edit is staged. The fields appear only once the header is
+clicked, and a save the Host confirms closes the card again — a rejected one
+keeps its diagnostics, and its drafts, in view.
+
 | Field | Meaning |
 |---|---|
 | `bucket`, `endpoint`, `region`, `forcePathStyle`, `accessKeyIdEnv`, `secretAccessKeyEnv` | Connection parameters; the entry config is the base layer, so an unset field keeps what `cordis.yml` and the environment supply. An endpoint without a URL scheme is normalized to `https://`. TOS/OSS/AWS use `forcePathStyle: false`; enable it only when a MinIO-compatible service requires it. |
@@ -322,9 +330,11 @@ synced document: it is the bootstrap credential.
 ## Known limitations
 
 - **The settings page card is not verified on screen.** The browser half
-  exists, is discovered, is served, and evaluates without error, and the host
-  half behind it is covered by the smoke test — but no run has yet confirmed
-  the card's rendered layout, so treat that layout as unproven.
+  exists, is discovered, is served, and evaluates without error; `pnpm test:card`
+  materializes the built bundle against a stubbed module table and asserts the
+  card's markup and its disclosure from that; and the host half behind it is
+  covered by the smoke test. What none of those cover is CSS: no run has
+  confirmed how the card renders in a browser, so treat its layout as unproven.
 - **No `.env` fallback.** `dsh-credentials-local` layers the process
   environment, the stored file, `<cwd>/.env`, and `$DSH_HOME/.env`. This
   provider layers the environment and the bucket only. Put values that used to
@@ -373,6 +383,7 @@ which is why it looks the way it does:
 pnpm install
 pnpm build          # tsc → lib/, then esbuild → lib/client.js
 pnpm smoke          # fake-S3 end-to-end checks
+pnpm test:card      # the browser card, against a stubbed module table
 pnpm test:patch     # the app.asar patcher, on a synthetic archive
 ```
 

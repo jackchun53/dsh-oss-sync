@@ -207,6 +207,11 @@ Governance 模式的 bucket 版本控制：正是它把一次误覆盖变成一�
 实时值带到浏览器：命名空间在每次 commit 时重新解析，客户端的镜像会把它转发出去。
 不需要第二条通道。
 
+卡片默认收起。`Settings → Plugins` 是一个插件一行的列表，所以表头直接写明是哪张卡片、
+它管什么，以及不展开也能看到的状态：保存 bucket 之前显示 `仅本机`，部署不可写时显示
+`只读`，宿主还没应答时显示 `等待宿主`，有未保存改动时显示 `未保存`。字段要点击表头才
+出现；宿主确认保存成功后卡片会重新收起，被拒绝的保存则把诊断和暂存的改动留在眼前。
+
 | 字段 | 含义 |
 |---|---|
 | `bucket`、`endpoint`、`region`、`forcePathStyle`、`accessKeyIdEnv`、`secretAccessKeyEnv` | 连接参数；条目配置是最底层，所以没填的字段保持 `cordis.yml` 和环境变量给的值。不带 URL scheme 的 endpoint 会被规范化为 `https://`。TOS/OSS/AWS 用 `forcePathStyle: false`；只有兼容 MinIO 的服务要求时才打开。 |
@@ -288,8 +293,9 @@ access key 本身必须来自机器的环境，绝不能来自同步文档：它
 ## 已知限制
 
 - **设置页卡片尚未在屏幕上验证过。** 浏览器那半边存在、能被发现、能被下发、求值
-  也不报错，它背后的宿主那半边有 smoke 测试覆盖 —— 但还没有一次运行确认过卡片的
-  实际渲染布局，所以那个布局只能算未证实。
+  也不报错；`pnpm test:card` 会把构建产物对着一个桩模块表物化出来，并据此断言卡片的
+  标记和它的展开/收起行为；它背后的宿主那半边有 smoke 测试覆盖。这些都没覆盖到的是
+  CSS：还没有一次运行确认过卡片在浏览器里的渲染，所以那个布局只能算未证实。
 - **没有 `.env` 回退。** `dsh-credentials-local` 会依次叠加进程环境、存储文件、
   `<cwd>/.env` 和 `$DSH_HOME/.env`。本 provider 只叠加环境和 bucket。以前放在
   `.env` 里的值请放进存储，或者继续导出它们。
@@ -330,6 +336,7 @@ harness 自身的加载规则有两个后果塑造了本包的结构，这也是
 pnpm install
 pnpm build          # tsc → lib/，再 esbuild → lib/client.js
 pnpm smoke          # 假 S3 的端到端检查
+pnpm test:card      # 浏览器端卡片，跑在桩模块表上
 pnpm test:patch     # asar 补丁工具，跑在内存里合成的归档上
 ```
 

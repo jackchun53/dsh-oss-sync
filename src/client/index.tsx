@@ -10,11 +10,20 @@
  *
  * Single-file on purpose. The host serves one built bundle per package, so a
  * relative import here would be a second module the browser never fetches.
+ * Nothing here is a stylesheet either: the bundle has nowhere to put a CSS
+ * module, so the card's chrome rides inline styles, and hover is spelled out as
+ * state because an inline style carries no `:hover`.
+ *
+ * The card discloses in place, the way the Host's own plugin cards do: the
+ * settings page lists one row per plugin, and which one a reader has open is a
+ * reading gesture rather than a persisted setting. It starts closed, since the
+ * fields are the tallest thing on the page and most visits never touch them.
  *
  * @module dsh-oss-sync/client
  */
 
-import type { CSSProperties } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { IconChevronDownOutline14, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: brings the `ctx.slots` context merge.
@@ -290,12 +299,103 @@ function renderValue(value: unknown): string {
   return value === undefined || value === null ? '' : String(value)
 }
 
+/**
+ * Card chrome, in the tokens the settings page around it uses. Only
+ * `--dsw-alias-*` follows the theme; the `--dsh-*` names this card used before
+ * are not tokens, so every colour was silently its light-mode fallback.
+ */
+const CARD: CSSProperties = {
+  listStyle: 'none',
+  border: '0.5px solid var(--dsw-alias-border-l4)',
+  borderRadius: '16px',
+  background: 'var(--dsw-alias-bg-layer-3)',
+  transition: 'border-color .16s, background .16s',
+}
+/** An open card reads as the one being worked on, not merely taller. */
+const CARD_OPEN: CSSProperties = {
+  background: 'var(--dsw-alias-bg-layer-2)',
+  borderColor: 'var(--dsw-alias-label-dimmed)',
+}
+/** The hover the neighbouring cards get from their stylesheet. */
+const CARD_HOVER: CSSProperties = { borderColor: 'var(--dsw-alias-label-dimmed)' }
+/** The whole header is the disclosure control, not just the chevron. */
+const HEADER: CSSProperties = {
+  appearance: 'none',
+  width: '100%',
+  border: 0,
+  background: 'none',
+  font: 'inherit',
+  color: 'inherit',
+  textAlign: 'left',
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  gap: '12px',
+  padding: '14px 16px',
+  borderRadius: '12px',
+}
+/** Name over description, so two collapsed cards stay tellable apart. */
+const HEAD_TEXT: CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '4px',
+}
+/** Card name. */
+const NAME: CSSProperties = {
+  fontSize: '15px',
+  fontWeight: 600,
+  lineHeight: 1.4,
+  color: 'var(--dsw-alias-label-primary)',
+}
+/** What this card's settings govern. */
+const DESCRIPTION: CSSProperties = {
+  fontSize: '13px',
+  lineHeight: 1.5,
+  color: 'var(--dsw-alias-label-tertiary)',
+}
+/** Rotation rides the wrapper: an icon takes `size` and `className`, not a style. */
+const CHEVRON: CSSProperties = {
+  flex: 'none',
+  display: 'inline-flex',
+  color: 'var(--dsw-alias-label-tertiary)',
+  transition: 'transform .16s',
+}
+/** The disclosed controls, separated from the header it sits under. */
+const BODY: CSSProperties = {
+  borderTop: '0.5px solid var(--dsw-alias-border-l2)',
+  margin: '0 16px',
+  paddingBottom: '8px',
+}
+/** Stated in the body so a read-only deployment is not a silently dead form. */
+const READ_ONLY: CSSProperties = {
+  margin: '12px 0 0',
+  fontSize: '12px',
+  lineHeight: 1.5,
+  color: 'var(--dsw-alias-label-tertiary)',
+}
 /** Shared inline style for a field label. */
-const LABEL: CSSProperties = { display: 'block', fontSize: '12px', fontWeight: 600, marginBottom: '2px' }
+const LABEL: CSSProperties = {
+  display: 'block',
+  fontSize: '12px',
+  fontWeight: 600,
+  marginBottom: '2px',
+  color: 'var(--dsw-alias-label-secondary)',
+}
 /** Shared inline style for a field hint and every status value. */
-const HINT: CSSProperties = { color: 'var(--dsh-text-secondary, #666)', fontSize: '11px' }
+const HINT: CSSProperties = { color: 'var(--dsw-alias-label-tertiary)', fontSize: '11px' }
 /** Shared inline style for a text input. */
-const INPUT: CSSProperties = { width: '100%', padding: '4px 6px', font: 'inherit' }
+const INPUT: CSSProperties = {
+  width: '100%',
+  padding: '5px 8px',
+  font: 'inherit',
+  fontSize: '13px',
+  color: 'var(--dsw-alias-label-primary)',
+  background: 'var(--dsw-alias-bg-layer-1)',
+  border: '0.5px solid var(--dsw-alias-border-l4)',
+  borderRadius: '10px',
+}
 /** Shared inline style for a row of controls. */
 const ROW: CSSProperties = { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }
 
@@ -306,93 +406,126 @@ const ROW: CSSProperties = { display: 'flex', gap: '8px', flexWrap: 'wrap', marg
  */
 function OssSyncCard(props: OssSyncCardProps) {
   const state = props.useOssSyncCard(snapshot => snapshot)
+  const [open, setOpen] = useState(false)
+  const [hovered, setHovered] = useState(false)
+  const saveStarted = useRef(false)
   // A provider that reports no bucket is local-only, which is the state the
   // card exists to end: actions have nothing to reach until one is saved.
   const unconfigured = Object.values(state.status).some(entry => entry.configured === false)
+  // Settle on the Host's answer rather than on the click: a rejected save keeps
+  // its diagnostics and its retained drafts in view, where they can be fixed.
+  useEffect(() => {
+    if (state.saving) {
+      saveStarted.current = true
+      return
+    }
+    if (!saveStarted.current) return
+    saveStarted.current = false
+    if (!state.dirty && state.failure === undefined) setOpen(false)
+  }, [state.dirty, state.failure, state.saving])
+
+  // One badge, in the order a reader needs it: a card that cannot reach its
+  // bucket matters more than one that is merely not writable from here.
+  const badge = !state.ready ? '等待宿主' : unconfigured ? '仅本机' : state.writable ? undefined : '只读'
   return (
-    <div style={{ border: '1px solid var(--dsh-border, #ddd)', borderRadius: '6px', padding: '12px' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-        <strong>OSS 同步</strong>
-        <span style={HINT}>
-          {state.ready ? (state.writable ? '可写' : '只读') : '等待宿主'}
+    <li style={{ ...CARD, ...(open ? CARD_OPEN : {}), ...(hovered && !open ? CARD_HOVER : {}) }}>
+      <button
+        type="button"
+        style={HEADER}
+        aria-expanded={open}
+        aria-label={`${open ? '收起' : '展开'}：OSS 同步`}
+        onMouseEnter={() => { setHovered(true) }}
+        onMouseLeave={() => { setHovered(false) }}
+        onClick={() => { setOpen(!open) }}
+      >
+        <span style={HEAD_TEXT}>
+          <span style={NAME}>OSS 同步</span>
+          <span style={DESCRIPTION}>设置与密钥存放于 S3 兼容的存储桶，每台机器读取同一份文档。</span>
         </span>
-      </div>
-      <p style={{ ...HINT, margin: '4px 0 10px' }}>
-        设置与密钥都存放在 S3 兼容的存储桶里，因此每台机器读取同一份文档。改动会在下一次请求时生效；
-        存储桶与端点立即生效。
-      </p>
+        {badge === undefined ? null : <Tag tone={unconfigured ? 'warning' : 'quiet'}>{badge}</Tag>}
+        {state.dirty ? <Tag tone="neutral">未保存</Tag> : null}
+        <span style={open ? { ...CHEVRON, transform: 'rotate(180deg)' } : CHEVRON}>
+          <IconChevronDownOutline14 />
+        </span>
+      </button>
 
-      {unconfigured ? (
-        <p style={{ ...HINT, margin: '0 0 10px' }}>
-          尚未配置存储桶：在保存一个之前，设置与密钥只留在本机。保存时会以本机文档作为初始内容写入。
-        </p>
-      ) : null}
+      {open ? (
+        <div style={BODY}>
+          {state.writable ? null : <p style={READ_ONLY} role="status">当前为只读：这个部署不接受设置写入。</p>}
 
-      <div style={{ display: 'grid', gap: '8px' }}>
-        {FIELDS.map((entry) => {
-          const draft = state.drafts[entry.field]
-          return (
-            <label key={entry.field} htmlFor={`oss-sync-${entry.field}`}>
-              <span style={LABEL}>
-                {entry.label}
-                {state.overridden[entry.field] === undefined ? null : <em style={HINT}> （已覆盖）</em>}
+          {unconfigured ? (
+            <p style={{ ...HINT, margin: '10px 0' }}>
+              尚未配置存储桶：在保存一个之前，设置与密钥只留在本机。保存时会以本机文档作为初始内容写入。
+            </p>
+          ) : null}
+
+          <div style={{ display: 'grid', gap: '8px', marginTop: '10px' }}>
+            {FIELDS.map((entry) => {
+              const draft = state.drafts[entry.field]
+              return (
+                <label key={entry.field} htmlFor={`oss-sync-${entry.field}`}>
+                  <span style={LABEL}>
+                    {entry.label}
+                    {state.overridden[entry.field] === undefined ? null : <em style={HINT}> （已覆盖）</em>}
+                  </span>
+                  {entry.boolean === true ? (
+                    <select
+                      id={`oss-sync-${entry.field}`}
+                      style={INPUT}
+                      disabled={!state.writable || state.saving}
+                      value={draft ?? renderValue(state.values[entry.field])}
+                      onChange={(event) => { props.edit(entry.field, event.target.value) }}
+                    >
+                      <option value="false">关闭（虚拟主机式，OSS / TOS / AWS）</option>
+                      <option value="true">开启（路径式，部分 MinIO）</option>
+                    </select>
+                  ) : (
+                    <input
+                      id={`oss-sync-${entry.field}`}
+                      style={INPUT}
+                      type={entry.secret === true ? 'password' : 'text'}
+                      autoComplete={entry.secret === true ? 'new-password' : 'off'}
+                      disabled={!state.writable || state.saving}
+                      value={draft ?? renderValue(state.values[entry.field])}
+                      onChange={(event) => { props.edit(entry.field, event.target.value) }}
+                    />
+                  )}
+                  <span style={HINT}>{entry.hint}</span>
+                </label>
+              )
+            })}
+          </div>
+
+          <div style={ROW}>
+            <button type="button" disabled={!state.dirty || state.saving} onClick={() => { props.save() }}>
+              {state.saving ? '保存中…' : '保存'}
+            </button>
+            <button type="button" disabled={!state.dirty || state.saving} onClick={() => { props.discard() }}>
+              放弃
+            </button>
+            <button type="button" disabled={!state.ready || unconfigured} onClick={() => { props.action('pull') }}>
+              立即同步
+            </button>
+            <button type="button" disabled={!state.ready || unconfigured} onClick={() => { props.action('push') }}>
+              强制推送
+            </button>
+          </div>
+
+          {state.failure === undefined ? null : (
+            <p style={{ ...HINT, color: 'var(--dsw-alias-state-error-primary)' }}>{state.failure}</p>
+          )}
+
+          {(['settings', 'credentials'] as const).map(label => (
+            <div key={label} style={{ marginTop: '10px' }}>
+              <span style={LABEL}>{label === 'settings' ? '设置' : '密钥'}</span>
+              <span style={HINT}>
+                {describeStatus(state.status[label])}
               </span>
-              {entry.boolean === true ? (
-                <select
-                  id={`oss-sync-${entry.field}`}
-                  style={INPUT}
-                  disabled={!state.writable || state.saving}
-                  value={draft ?? renderValue(state.values[entry.field])}
-                  onChange={(event) => { props.edit(entry.field, event.target.value) }}
-                >
-                  <option value="false">关闭（虚拟主机式，OSS / TOS / AWS）</option>
-                  <option value="true">开启（路径式，部分 MinIO）</option>
-                </select>
-              ) : (
-                <input
-                  id={`oss-sync-${entry.field}`}
-                  style={INPUT}
-                  type={entry.secret === true ? 'password' : 'text'}
-                  autoComplete={entry.secret === true ? 'new-password' : 'off'}
-                  disabled={!state.writable || state.saving}
-                  value={draft ?? renderValue(state.values[entry.field])}
-                  onChange={(event) => { props.edit(entry.field, event.target.value) }}
-                />
-              )}
-              <span style={HINT}>{entry.hint}</span>
-            </label>
-          )
-        })}
-      </div>
-
-      <div style={ROW}>
-        <button type="button" disabled={!state.dirty || state.saving} onClick={() => { props.save() }}>
-          {state.saving ? '保存中…' : '保存'}
-        </button>
-        <button type="button" disabled={!state.dirty || state.saving} onClick={() => { props.discard() }}>
-          放弃
-        </button>
-        <button type="button" disabled={!state.ready || unconfigured} onClick={() => { props.action('pull') }}>
-          立即同步
-        </button>
-        <button type="button" disabled={!state.ready || unconfigured} onClick={() => { props.action('push') }}>
-          强制推送
-        </button>
-      </div>
-
-      {state.failure === undefined ? null : (
-        <p style={{ ...HINT, color: 'var(--dsh-danger, #b00)' }}>{state.failure}</p>
-      )}
-
-      {(['settings', 'credentials'] as const).map(label => (
-        <div key={label} style={{ marginTop: '10px' }}>
-          <span style={LABEL}>{label === 'settings' ? '设置' : '密钥'}</span>
-          <span style={HINT}>
-            {describeStatus(state.status[label])}
-          </span>
+            </div>
+          ))}
         </div>
-      ))}
-    </div>
+      ) : null}
+    </li>
   )
 }
 

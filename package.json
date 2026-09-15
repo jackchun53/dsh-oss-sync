@@ -37,6 +37,7 @@
     "install:profiles": "node scripts/install.mjs",
     "patch:desktop": "node scripts/patch-desktop-asar.mjs",
     "smoke": "node test/smoke.mjs",
+    "test:card": "node test/card.mjs",
     "test:patch": "node test/patch-asar.mjs",
     "prepublishOnly": "pnpm build"
   },
