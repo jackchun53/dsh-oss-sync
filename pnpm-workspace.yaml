@@ -1,6 +1,9 @@
 packages:
   - .
 
+allowBuilds:
+  esbuild: true
+
 # The harness seams are peer dependencies resolved from the running dsh
 # installation at runtime. Auto-installing them from npm would put a second,
 # older copy of `@deepseek-ai/dsh-settings` next to this plugin, and the
