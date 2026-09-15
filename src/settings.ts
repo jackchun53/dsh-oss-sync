@@ -28,6 +28,7 @@ import {
 import {
   ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope, type StoredConnection,
 } from './envelope.js'
+import { readLegacySettings } from './legacy.js'
 import { PollLoop } from './poll.js'
 import { ObjectStore, PreconditionFailedError } from './store.js'
 
@@ -162,10 +163,36 @@ export class OssSettingsProvider extends SettingsProvider {
    */
   private async loadCache(): Promise<SettingsDocument | undefined> {
     const cached = await this.state.readCache<SettingsDocument>(OBJECT_NAME)
-    if (cached === undefined) return undefined
-    this.local = cached.doc
-    this.revision = cached.rev
-    return cached.doc
+    let document = cached?.doc
+    let revision = cached?.rev ?? 0
+    if (!await this.state.legacyImported(OBJECT_NAME)) {
+      try {
+        const legacy = await readLegacySettings()
+        if (legacy !== undefined) {
+          // The sync cache wins conflicts: it may contain edits made after the
+          // plugin was installed. The legacy file only restores namespaces the
+          // first build failed to carry across.
+          document = { ...legacy, ...document }
+          const envelope: Envelope<SettingsDocument> = {
+            v: ENVELOPE_VERSION,
+            rev: revision,
+            writer: cached?.writer ?? await this.state.deviceId(),
+            updatedAt: cached?.updatedAt ?? new Date().toISOString(),
+            doc: document,
+          }
+          await this.state.writeCache(OBJECT_NAME, envelope)
+          this.ctx.logger.info('dsh-oss-sync: imported the existing settings.yaml into the sync cache')
+        }
+        await this.state.markLegacyImported(OBJECT_NAME)
+      } catch (error) {
+        this.ctx.logger.warn('dsh-oss-sync: could not import the existing settings.yaml; leaving it untouched')
+        this.ctx.logger.warn(error)
+      }
+    }
+    if (document === undefined) return undefined
+    this.local = document
+    this.revision = revision
+    return document
   }
 
   /**

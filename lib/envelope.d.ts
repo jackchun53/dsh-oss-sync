@@ -74,6 +74,10 @@ export declare class SyncState {
      * @returns the device id.
      */
     deviceId(): Promise<string>;
+    /** Whether this machine already imported the file-backed store replaced by one object. */
+    legacyImported(name: string): Promise<boolean>;
+    /** Mark one file-backed store as imported, so later deletes are not resurrected on restart. */
+    markLegacyImported(name: string): Promise<void>;
     /**
      * Read the cached envelope for one object.
      * @param name - object name inside the prefix (`settings.yaml`).
@@ -88,4 +92,6 @@ export declare class SyncState {
     writeCache<T>(name: string, envelope: Envelope<T>): Promise<void>;
     /** Cache path for one object; the prefix is already part of the configured directory. */
     private cachePath;
+    /** One-time import marker for the file-backed provider this object replaced. */
+    private legacyMarkerPath;
 }

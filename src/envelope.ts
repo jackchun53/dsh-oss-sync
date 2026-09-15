@@ -174,6 +174,23 @@ export class SyncState {
     return created
   }
 
+  /** Whether this machine already imported the file-backed store replaced by one object. */
+  async legacyImported(name: string): Promise<boolean> {
+    try {
+      await readFile(this.legacyMarkerPath(name), 'utf8')
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return false
+      throw error
+    }
+  }
+
+  /** Mark one file-backed store as imported, so later deletes are not resurrected on restart. */
+  async markLegacyImported(name: string): Promise<void> {
+    await mkdir(this.dir, { recursive: true })
+    await writeFile(this.legacyMarkerPath(name), '1\n', { encoding: 'utf8', mode: 0o600 })
+  }
+
   /**
    * Read the cached envelope for one object.
    * @param name - object name inside the prefix (`settings.yaml`).
@@ -202,5 +219,10 @@ export class SyncState {
   /** Cache path for one object; the prefix is already part of the configured directory. */
   private cachePath(name: string): string {
     return join(this.dir, `${name}.cache`)
+  }
+
+  /** One-time import marker for the file-backed provider this object replaced. */
+  private legacyMarkerPath(name: string): string {
+    return join(this.dir, `${name}.legacy-imported`)
   }
 }

@@ -28,6 +28,7 @@ import { SYNC_NAMESPACE, type SyncControl, type SyncSettings, type SyncStatus } 
 import {
   ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope, type StoredConnection,
 } from './envelope.js'
+import { readLegacyCredentials } from './legacy.js'
 import { PollLoop } from './poll.js'
 import { ObjectStore, PreconditionFailedError } from './store.js'
 
@@ -290,9 +291,38 @@ export class OssCredentialProvider extends CredentialProvider {
    */
   private async loadCache(): Promise<CredentialDocument | undefined> {
     const cached = await this.state.readCache<CredentialDocument>(OBJECT_NAME)
-    if (cached === undefined) return undefined
-    this.local = asDocument(cached.doc)
-    this.revision = cached.rev
+    let document = cached === undefined ? undefined : asDocument(cached.doc)
+    const revision = cached?.rev ?? 0
+    if (!await this.state.legacyImported(OBJECT_NAME)) {
+      try {
+        const legacy = await readLegacyCredentials()
+        if (legacy !== undefined) {
+          // Values already written through this provider win conflicts. The
+          // one-time import only restores provider API keys and records the
+          // replaced local store held but the early sync cache omitted.
+          document = {
+            refs: { ...legacy.refs, ...document?.refs },
+            records: { ...legacy.records, ...document?.records },
+          }
+          const envelope: Envelope<CredentialDocument> = {
+            v: ENVELOPE_VERSION,
+            rev: revision,
+            writer: cached?.writer ?? await this.state.deviceId(),
+            updatedAt: cached?.updatedAt ?? new Date().toISOString(),
+            doc: document,
+          }
+          await this.state.writeCache(OBJECT_NAME, envelope)
+          this.ctx.logger.info('dsh-oss-sync: imported the existing .credentials.yaml into the sync cache')
+        }
+        await this.state.markLegacyImported(OBJECT_NAME)
+      } catch (error) {
+        this.ctx.logger.warn('dsh-oss-sync: could not import the existing .credentials.yaml; leaving it untouched')
+        this.ctx.logger.warn(error)
+      }
+    }
+    if (document === undefined) return undefined
+    this.local = document
+    this.revision = revision
     return this.local
   }
 

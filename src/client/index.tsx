@@ -42,25 +42,33 @@ interface FieldSpec {
   secret?: boolean
   /** Write an empty string instead of unsetting, so emptying the input clears what is stored. */
   clearWithEmpty?: boolean
+  /** Render a true/false selector and persist a boolean rather than text. */
+  boolean?: boolean
 }
 
 /** Fields the card edits, in render order. */
 const FIELDS: readonly FieldSpec[] = [
-  { field: 'bucket', label: '存储桶', hint: '两份文档都存放于此。' },
-  { field: 'endpoint', label: '端点', hint: 'S3 兼容地址；留空表示使用 AWS。' },
+  { field: 'bucket', label: '存储桶', hint: '两份文档都存放于此，例如 dsh-config。' },
+  { field: 'endpoint', label: 'S3 端点', hint: '例如 https://tos-s3-cn-shanghai.volces.com；省略协议时自动补 https://。' },
   { field: 'prefix', label: '键前缀', hint: '修改后会移动两份文档。' },
-  { field: 'region', label: '区域', hint: '签名使用的区域。' },
+  { field: 'region', label: '签名区域', hint: '必须使用服务商的区域值；火山 TOS 上海通常为 cn-shanghai。' },
+  {
+    field: 'forcePathStyle',
+    label: '路径式寻址',
+    hint: '火山 TOS、阿里云 OSS 与 AWS 请选择“关闭”；MinIO 等仅在要求 path-style 时开启。',
+    boolean: true,
+  },
   { field: 'pollMs', label: '轮询间隔（毫秒）', hint: '另一台机器的写入多久到达本机。' },
   {
     field: 'accessKeyId',
-    label: '访问密钥 ID',
-    hint: '只保存在本机，不会写入存储桶。',
+    label: '对象存储 AccessKey ID',
+    hint: '这是 OSS/TOS 的访问密钥，不是模型提供方 API Key；只保存在本机。',
     clearWithEmpty: true,
   },
   {
     field: 'secretAccessKey',
-    label: '访问密钥 Secret',
-    hint: '只保存在本机，不会写入存储桶；清空即删除本机保存的密钥。',
+    label: '对象存储 AccessKey Secret',
+    hint: '这是 OSS/TOS 的访问密钥，不是模型提供方 API Key；清空两项即删除本机保存。',
     secret: true,
     clearWithEmpty: true,
   },
@@ -235,13 +243,25 @@ class CardController {
       this.snapshot.set({ ...state, failure: '访问密钥 ID 与 Secret 必须同时填写或同时清空' })
       return
     }
+    const pollDraft = state.drafts['pollMs']
+    if (pollDraft !== undefined && (!Number.isFinite(Number(pollDraft)) || Number(pollDraft) < 1000)) {
+      this.snapshot.set({ ...state, failure: '轮询间隔必须是不小于 1000 的数字' })
+      return
+    }
     this.snapshot.set({ ...state, saving: true, failure: undefined })
     try {
-      for (const entry of pending) {
+      // One atomic namespace mutation keeps the bucket, addressing mode, and
+      // credential pair behind the same revision fence. Saving them field by
+      // field briefly built an invalid half-configured connection and made a
+      // first-time setup look as if the form had ignored it.
+      await this.scope.mutate(pending.map((entry) => {
         const text = state.drafts[entry.field] ?? ''
-        if (text.length === 0 && entry.clearWithEmpty !== true) await this.scope.unset(entry.field)
-        else await this.scope.set(entry.field, entry.field === 'pollMs' ? Number(text) : text)
-      }
+        if (text.length === 0 && entry.clearWithEmpty !== true) {
+          return { op: 'unset' as const, path: [entry.field] }
+        }
+        const value = entry.field === 'pollMs' ? Number(text) : entry.boolean === true ? text === 'true' : text
+        return { op: 'set' as const, path: [entry.field], value }
+      }))
       const latest = this.snapshot.getSnapshot()
       this.snapshot.set({ ...latest, drafts: {}, dirty: false, saving: false })
     } catch (error) {
@@ -317,15 +337,28 @@ function OssSyncCard(props: OssSyncCardProps) {
                 {entry.label}
                 {state.overridden[entry.field] === undefined ? null : <em style={HINT}> （已覆盖）</em>}
               </span>
-              <input
-                id={`oss-sync-${entry.field}`}
-                style={INPUT}
-                type={entry.secret === true ? 'password' : 'text'}
-                autoComplete={entry.secret === true ? 'new-password' : 'off'}
-                disabled={!state.writable || state.saving}
-                value={draft ?? renderValue(state.values[entry.field])}
-                onChange={(event) => { props.edit(entry.field, event.target.value) }}
-              />
+              {entry.boolean === true ? (
+                <select
+                  id={`oss-sync-${entry.field}`}
+                  style={INPUT}
+                  disabled={!state.writable || state.saving}
+                  value={draft ?? renderValue(state.values[entry.field])}
+                  onChange={(event) => { props.edit(entry.field, event.target.value) }}
+                >
+                  <option value="false">关闭（虚拟主机式，OSS / TOS / AWS）</option>
+                  <option value="true">开启（路径式，部分 MinIO）</option>
+                </select>
+              ) : (
+                <input
+                  id={`oss-sync-${entry.field}`}
+                  style={INPUT}
+                  type={entry.secret === true ? 'password' : 'text'}
+                  autoComplete={entry.secret === true ? 'new-password' : 'off'}
+                  disabled={!state.writable || state.saving}
+                  value={draft ?? renderValue(state.values[entry.field])}
+                  onChange={(event) => { props.edit(entry.field, event.target.value) }}
+                />
+              )}
               <span style={HINT}>{entry.hint}</span>
             </label>
           )

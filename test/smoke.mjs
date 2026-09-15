@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -16,6 +16,7 @@ import OssSettingsProvider from '../lib/settings.js'
 import OssCredentialProvider from '../lib/credentials.js'
 import { ObjectStore, PreconditionFailedError } from '../lib/store.js'
 import { resolveConfig } from '../lib/config.js'
+import { SyncState } from '../lib/envelope.js'
 
 const service = await startFakeS3()
 const root = await mkdtemp(join(tmpdir(), 'dsh-oss-sync-'))
@@ -59,9 +60,68 @@ async function boot(Plugin, config) {
 }
 
 const cleanups = []
+const previousDshHome = process.env['DSH_HOME']
 try {
+  process.env['DSH_HOME'] = home
   process.env['SMOKE_ACCESS_KEY_ID'] = 'test'
   process.env['SMOKE_SECRET_ACCESS_KEY'] = 'test'
+
+  // Standard S3-compatible services use virtual-hosted addressing. In
+  // particular, TOS rejects /bucket/key with InvalidPathAccess.
+  const normalized = resolveConfig({ endpoint: 'tos-s3-cn-shanghai.volces.com' })
+  assert.equal(normalized.endpoint, 'https://tos-s3-cn-shanghai.volces.com')
+  assert.equal(normalized.forcePathStyle, false)
+  assert.equal(resolveConfig({ forcePathStyle: true }).forcePathStyle, true)
+  console.log('ok  config: endpoints are absolute and virtual-hosted addressing is the default')
+
+  // ── first install: import the file stores this bundle replaces ───────────
+  await writeFile(join(home, 'settings.yaml'), 'legacy-probe:\n  value: 23\n')
+  await writeFile(join(home, '.credentials.yaml'), [
+    'version: 1',
+    'refs:',
+    '  LEGACY_PROVIDER_KEY: sk-from-old-store',
+    'records:',
+    '  legacy-owner/grant:',
+    '    kind: grant',
+    '    payload:',
+    '      token: old-record',
+    '',
+  ].join('\n'))
+
+  const legacySettingsDir = join(root, 'legacy-settings')
+  const legacySettings = await boot(OssSettingsProvider, { ...machineConfig(legacySettingsDir), bucket: '' })
+  cleanups.push(() => legacySettings.fiber.dispose())
+  assert.equal(legacySettings.ctx.settings.register('legacy-probe', Schema).get().value, 23,
+    'settings.yaml is visible through the replacement provider on its first boot')
+
+  const legacyCredentialsDir = join(root, 'legacy-credentials')
+  // Reproduce the released 0.1.5 failure exactly: it already created a cache,
+  // but that cache contains no model-provider refs from .credentials.yaml.
+  await new SyncState(legacyCredentialsDir).writeCache('credentials.yaml', {
+    v: 1,
+    rev: 1,
+    writer: 'early-plugin',
+    updatedAt: new Date().toISOString(),
+    doc: { refs: {}, records: {} },
+  })
+  const legacyCredentials = await boot(OssCredentialProvider, { ...machineConfig(legacyCredentialsDir), bucket: '' })
+  cleanups.push(() => legacyCredentials.fiber.dispose())
+  assert.deepEqual(await legacyCredentials.ctx.credentials.resolve('LEGACY_PROVIDER_KEY'),
+    { value: 'sk-from-old-store', source: 'oss' },
+    'the model-provider API key in .credentials.yaml is visible after installation')
+  assert.deepEqual(await legacyCredentials.ctx.credentials.readRecord('legacy-owner/grant'),
+    { kind: 'grant', payload: { token: 'old-record' } },
+    'credential records are imported with provider API keys')
+  await legacyCredentials.ctx.credentials.unset('LEGACY_PROVIDER_KEY')
+  await legacyCredentials.fiber.dispose()
+  cleanups.pop()
+  const legacyRestart = await boot(OssCredentialProvider, { ...machineConfig(legacyCredentialsDir), bucket: '' })
+  cleanups.push(() => legacyRestart.fiber.dispose())
+  assert.equal(await legacyRestart.ctx.credentials.resolve('LEGACY_PROVIDER_KEY'), undefined,
+    'the one-time marker prevents a deliberately deleted key from being resurrected')
+  await rm(join(home, 'settings.yaml'))
+  await rm(join(home, '.credentials.yaml'))
+  console.log('ok  migration: existing settings and model-provider API keys survive installation exactly once')
 
   // ── settings: two machines, one document ──────────────────────────────────
   const machineA = join(root, 'a')
@@ -361,5 +421,7 @@ try {
   await service.stop()
   await rm(root, { recursive: true, force: true })
   await rm(home, { recursive: true, force: true })
+  if (previousDshHome === undefined) delete process.env['DSH_HOME']
+  else process.env['DSH_HOME'] = previousDshHome
 }
 console.log('\nall smoke checks passed')

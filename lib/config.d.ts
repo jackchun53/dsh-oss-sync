@@ -27,7 +27,7 @@ export interface Config {
     region?: string;
     /** Key prefix inside the bucket; the two documents live directly under it. */
     prefix?: string;
-    /** Path-style addressing, which MinIO and most self-hosted gateways require. */
+    /** Opt into path-style addressing for services such as MinIO; standard S3-compatible endpoints use virtual hosts. */
     forcePathStyle?: boolean;
     /** Environment variable holding the access key id; defaults to `DSH_SYNC_ACCESS_KEY_ID`. */
     accessKeyIdEnv?: string;

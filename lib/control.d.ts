@@ -66,7 +66,7 @@ export interface SyncSettings extends SyncRuntime {
     prefix?: string;
     /** Poll interval in milliseconds. */
     pollMs?: number;
-    /** Path-style addressing, which self-hosted gateways require. */
+    /** Opt into path-style addressing for services such as MinIO. */
     forcePathStyle?: boolean;
     /** Environment variable holding the access key id. */
     accessKeyIdEnv?: string;

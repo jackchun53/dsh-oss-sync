@@ -1,5 +1,7 @@
 # dsh-oss-sync
 
+English | [中文](README.zh.md)
+
 Keep one machine's DeepSeek Harness settings and API keys in an S3-compatible
 bucket, so every other machine boots with the same configuration instead of
 having its files copied by hand.
@@ -24,6 +26,7 @@ dsh plugin --profile web add dsh-oss-sync
 #    or afterwards in Settings → Plugins, which is the same document
 export DSH_SYNC_BUCKET=my-dsh
 export DSH_SYNC_ENDPOINT=https://oss-cn-shanghai.aliyuncs.com   # omit for AWS
+export DSH_SYNC_REGION=cn-shanghai
 
 # 3. restart, then open Settings → Plugins
 ```
@@ -34,9 +37,11 @@ configuration is already in the bucket.
 
 Without a bucket the surfaces still start: the providers run local-only, every
 namespace resolves from this machine's own cached document, nothing is read or
-written to a service, and the card is where you supply one. Saving a bucket
-there seeds it from the document this machine holds, so nothing typed before
-the bucket existed is lost.
+written to a service, and the card is where you supply one. On the first boot,
+`settings.yaml` and `.credentials.yaml` are imported into that cache before the
+file-backed rows are retired. Saving a bucket there then seeds it from the
+whole document this machine holds, so existing model-provider API keys and
+anything typed before the bucket existed are not lost.
 
 ## Install
 
@@ -101,7 +106,9 @@ plugin window. Three properties make it fit that validation:
   `requires @deepseek-ai/dsh-credentials@*, found 0.1.5-rc.2`. The fix belongs
   in `apps/desktop/src/profile-packages.ts`
   (`satisfies(version, range, { includePrerelease: true })`), because no range
-  a plugin could declare survives the next prerelease tuple.
+  a plugin could declare survives the next prerelease tuple. Until a build
+  carrying it is in hand, patch the installed one — see *Older Desktop builds*
+  below.
 - Its ordinary dependencies (`@aws-sdk/client-s3`,
   `@aws-sdk/credential-provider-node`, `yaml`) resolve inside the profile and
   ship no install scripts, so the reviewed-build list does not need an entry.
@@ -119,6 +126,59 @@ a `.env` file — the harness treats the whole prefix as launch-environment-only
 
 Restart the surface after installing: the providers are mounted at boot.
 
+### Older Desktop builds
+
+The validator gap above is only fixable in the application, so a Desktop build
+that predates the fix rejects this package whatever the manifest says.
+`scripts/patch-desktop-asar.mjs` writes that one argument into an installed
+build instead, which is what makes the plugin installable there:
+
+```sh
+# 1. quit the application completely, tray included: app.asar is rewritten in place
+# 2. patch the installed build, at the default install directory
+node scripts/patch-desktop-asar.mjs --app "%LOCALAPPDATA%\Programs\DeepSeek Harness"
+
+# patched C:\Users\you\AppData\Local\Programs\DeepSeek Harness\resources\app.asar
+#   backup:   ...\resources\app.asar.bak
+#   files:    /lib/main.js (90953 -> 90982 bytes)
+#   size:     2365617 -> 2365646 bytes
+
+# 3. start it again, then install dsh-oss-sync from the plugin window
+```
+
+PowerShell spells the variable `$env:LOCALAPPDATA`, and a non-default install
+directory is whatever you pointed the installer at. No separate Node install is
+needed either way: the application ships one at
+`resources\runtime\node\node.exe`, beside the archive being patched, and any
+recent Node behaves identically.
+
+The script rides in the published tarball too, at
+`$DSH_HOME/profiles/desktop/node_modules/dsh-oss-sync/scripts/patch-desktop-asar.mjs`,
+which is the copy to reach for when the application is reinstalled later.
+
+| Invocation | Archive it patches |
+|---|---|
+| `node scripts/patch-desktop-asar.mjs` | `./resources/app.asar`: the unpacked build the shell is standing in |
+| `node scripts/patch-desktop-asar.mjs "<app.asar>"` | that archive |
+| `node scripts/patch-desktop-asar.mjs --app "<dir>"` | `<dir>/resources/app.asar` |
+| `node scripts/patch-desktop-asar.mjs --help` | nothing; prints the usage above |
+
+Exactly one file changes: `satisfies(dependency.version, range)` becomes
+`satisfies(dependency.version, range, { includePrerelease: true })` in the
+compiled `lib/main.js`. The asar header's per-file integrity entries are
+recomputed for that one file, so the archive stays structurally what
+`electron-builder` wrote and the application cannot tell the difference.
+
+The patch is idempotent — an already-patched archive prints `already patched;
+nothing to do` and exits — and the `.bak` beside it is written once, on the first
+run, so re-running never overwrites the original. It does have to be re-run
+after every reinstall or upgrade: `app.asar` is regenerated, and the patch is
+not.
+
+This is Windows-only, and only for the unsigned artifacts this project builds.
+Rewriting a signed macOS bundle's `app.asar` invalidates its signature and
+notarization.
+
 ## Configure
 
 ### Environment
@@ -134,6 +194,7 @@ it from storage until you set it there.
 | `DSH_SYNC_ENDPOINT` | S3-compatible endpoint (MinIO, Ceph, COS); omit for AWS. |
 | `DSH_SYNC_REGION` | Region for the signature; defaults to `us-east-1`. |
 | `DSH_SYNC_PREFIX` | Key prefix; defaults to `dsh-sync`. |
+| `DSH_SYNC_FORCE_PATH_STYLE` | Set to `true` only for services that require path-style addressing (commonly MinIO). Defaults to virtual-hosted style, which TOS, OSS, and AWS require. |
 | `DSH_SYNC_POLL_MS` | Poll interval in milliseconds; defaults to `30000`. |
 | `DSH_SYNC_ACCESS_KEY_ID` / `DSH_SYNC_SECRET_ACCESS_KEY` | Static credentials for the bucket; unset falls back to the pair saved in the settings card, then to the SDK's own chain (`AWS_ACCESS_KEY_ID`, a profile, an instance role). |
 
@@ -170,8 +231,8 @@ it. No second channel was needed.
 
 | Field | Meaning |
 |---|---|
-| `bucket`, `endpoint`, `region`, `forcePathStyle`, `accessKeyIdEnv`, `secretAccessKeyEnv` | Connection parameters; the entry config is the base layer, so an unset field keeps what `cordis.yml` and the environment supply. |
-| `accessKeyId`, `secretAccessKey` | The bucket's own credentials. Typed here, stored on this machine only (`$DSH_HOME/.dsh-oss-sync/connection.yaml`, mode 0600), never written to the bucket — a bucket cannot hold the credentials that reading it needs. Clearing both removes the local file. |
+| `bucket`, `endpoint`, `region`, `forcePathStyle`, `accessKeyIdEnv`, `secretAccessKeyEnv` | Connection parameters; the entry config is the base layer, so an unset field keeps what `cordis.yml` and the environment supply. An endpoint without a URL scheme is normalized to `https://`. TOS/OSS/AWS use `forcePathStyle: false`; enable it only when a MinIO-compatible service requires it. |
+| `accessKeyId`, `secretAccessKey` | The bucket's own OSS/TOS/S3 credentials — **not** a model provider API key. Typed here, stored on this machine only (`$DSH_HOME/.dsh-oss-sync/connection.yaml`, mode 0600), never written to the bucket. Clearing both removes the local file. |
 | `prefix` | Key prefix. Changing it moves both documents and seeds the new location from the document this machine holds. |
 | `pollMs` | Poll interval; applies immediately. |
 | `status` | Runtime, read-only. Per provider (`settings`, `credentials`): revision, writer, commit time, device id, object key, last read/write, last error. |
@@ -212,8 +273,10 @@ doc:
 `records` (per-plugin credential records, including authorization grants).
 
 Per-machine state stays local under `$DSH_HOME/.dsh-oss-sync/`: a stable
-`device-id`, plus a cache of the last document read, which is what lets a
-laptop boot offline with the configuration it last saw.
+`device-id`, a cache of the last document read, and one-time legacy-import
+markers. The original `settings.yaml` and `.credentials.yaml` are left
+untouched as recovery copies; the markers prevent a key deliberately deleted
+through the sync provider from being resurrected on the next restart.
 
 ## Concurrency and propagation
 
@@ -310,6 +373,7 @@ which is why it looks the way it does:
 pnpm install
 pnpm build          # tsc → lib/, then esbuild → lib/client.js
 pnpm smoke          # fake-S3 end-to-end checks
+pnpm test:patch     # the app.asar patcher, on a synthetic archive
 ```
 
 `tsconfig.json` resolves the `@deepseek-ai/*` peer packages through `paths`

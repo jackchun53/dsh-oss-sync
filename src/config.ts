@@ -31,7 +31,7 @@ export interface Config {
   region?: string
   /** Key prefix inside the bucket; the two documents live directly under it. */
   prefix?: string
-  /** Path-style addressing, which MinIO and most self-hosted gateways require. */
+  /** Opt into path-style addressing for services such as MinIO; standard S3-compatible endpoints use virtual hosts. */
   forcePathStyle?: boolean
   /** Environment variable holding the access key id; defaults to `DSH_SYNC_ACCESS_KEY_ID`. */
   accessKeyIdEnv?: string
@@ -56,7 +56,7 @@ export const ConfigSchema: z<Config> = z.object({
   endpoint: z.string(),
   region: z.string().default('us-east-1'),
   prefix: z.string().default('dsh-sync'),
-  forcePathStyle: z.boolean().default(true),
+  forcePathStyle: z.boolean().default(false),
   accessKeyIdEnv: z.string().default('DSH_SYNC_ACCESS_KEY_ID'),
   secretAccessKeyEnv: z.string().default('DSH_SYNC_SECRET_ACCESS_KEY'),
   pollMs: z.number().min(1000).default(30_000),
@@ -101,7 +101,16 @@ export interface ResolvedConfig {
  * @returns the value, or `undefined` when it addresses nothing.
  */
 function clearable(value: string | undefined): string | undefined {
-  return value === undefined || value.length === 0 ? undefined : value
+  if (value === undefined) return undefined
+  const trimmed = value.trim()
+  return trimmed.length === 0 ? undefined : trimmed
+}
+
+/** Normalize a custom endpoint; the AWS SDK requires an absolute URL. */
+function endpointUrl(value: string | undefined): string | undefined {
+  const endpoint = clearable(value)
+  if (endpoint === undefined) return undefined
+  return /^[a-z][a-z\d+.-]*:\/\//iu.test(endpoint) ? endpoint : `https://${endpoint}`
 }
 
 /**
@@ -125,12 +134,13 @@ export function resolveConfig(config: Config): ResolvedConfig {
   const stateDir = config.stateDir ?? join(resolveDshHome(), '.dsh-oss-sync')
   const accessKeyId = clearable(config.accessKeyId)
   const secretAccessKey = clearable(config.secretAccessKey)
+  const endpoint = endpointUrl(config.endpoint)
   return {
-    bucket: config.bucket ?? '',
-    ...config.endpoint === undefined ? {} : { endpoint: config.endpoint },
-    region: config.region ?? 'us-east-1',
-    prefix: (config.prefix ?? 'dsh-sync').replace(/\/+$/u, ''),
-    forcePathStyle: config.forcePathStyle ?? true,
+    bucket: config.bucket?.trim() ?? '',
+    ...endpoint === undefined ? {} : { endpoint },
+    region: config.region?.trim() || 'us-east-1',
+    prefix: (config.prefix ?? 'dsh-sync').trim().replace(/\/+$/u, ''),
+    forcePathStyle: config.forcePathStyle ?? false,
     accessKeyIdEnv: config.accessKeyIdEnv ?? 'DSH_SYNC_ACCESS_KEY_ID',
     secretAccessKeyEnv: config.secretAccessKeyEnv ?? 'DSH_SYNC_SECRET_ACCESS_KEY',
     pollMs: config.pollMs ?? 30_000,
@@ -151,11 +161,12 @@ export function applyOverrides(base: ResolvedConfig, overrides: SpecOverrides | 
   const prefix = overrides.prefix ?? base.prefix
   const accessKeyId = clearable(overrides.accessKeyId ?? base.accessKeyId)
   const secretAccessKey = clearable(overrides.secretAccessKey ?? base.secretAccessKey)
+  const endpoint = endpointUrl(overrides.endpoint ?? base.endpoint)
   return {
-    bucket: overrides.bucket ?? base.bucket,
-    ...(overrides.endpoint ?? base.endpoint) === undefined ? {} : { endpoint: overrides.endpoint ?? base.endpoint },
-    region: overrides.region ?? base.region,
-    prefix: prefix.replace(/\/+$/u, ''),
+    bucket: (overrides.bucket ?? base.bucket).trim(),
+    ...endpoint === undefined ? {} : { endpoint },
+    region: (overrides.region ?? base.region).trim(),
+    prefix: prefix.trim().replace(/\/+$/u, ''),
     forcePathStyle: overrides.forcePathStyle ?? base.forcePathStyle,
     accessKeyIdEnv: overrides.accessKeyIdEnv ?? base.accessKeyIdEnv,
     secretAccessKeyEnv: overrides.secretAccessKeyEnv ?? base.secretAccessKeyEnv,

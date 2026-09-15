@@ -32,6 +32,7 @@ Before publishing, confirm the committed build is not stale:
 pnpm build
 git diff --exit-code -- lib    # empty means lib/ matches src/
 pnpm smoke
+pnpm test:patch
 ```
 
 ### 2FA
@@ -65,6 +66,12 @@ have to hold and are worth re-checking on any manifest change:
 - Ordinary dependencies must resolve inside the profile and ship no install
   scripts, so the reviewed-build list needs no entry.
 - Nothing may need to build at install time.
+
+The validator gap has a shipped workaround: `scripts/patch-desktop-asar.mjs`
+rewrites that one `satisfies` call inside an installed `resources/app.asar`, and
+is listed in `files` so it travels with the tarball. Keep it dependency-free and
+single-file — it has to run on a machine where nothing from this package is
+installed yet, using only whatever Node the application itself brought.
 
 Also `peerDependencies` are not installed automatically here: `pnpm-workspace.yaml`
 sets `autoInstallPeers: false` deliberately, so a second `@deepseek-ai/dsh-settings`
@@ -128,13 +135,20 @@ start without ever reaching the bucket.
 
 `test/serve-fake-s3.mjs` serves the same fake over HTTP for manual poking.
 
+`pnpm test:patch` covers `scripts/patch-desktop-asar.mjs` on a synthetic asar
+built in memory, so it needs neither a build nor the Desktop application: the
+target call gains its argument exactly once, every other entry and offset
+survives, the changed entry's integrity is restated while the untouched ones are
+left alone, the `.bak` is the original, a second run is a no-op, and a target-free
+archive is refused without leaving a backup beside it.
+
 ## Layout
 
 ```
 src/            host half; lib/index.js is the settings provider
 src/client/     browser half; single file, bundled to lib/client.js
 cordis.patch.yml  disables the two base rows and inserts this plugin's
-scripts/        build-client.mjs, install.mjs
-test/           fake S3 and the smoke checks
+scripts/        build-client.mjs, install.mjs, patch-desktop-asar.mjs
+test/           fake S3, the smoke checks, and the app.asar patcher round trip
 lib/            committed build output — the published tarball carries it
 ```

@@ -201,6 +201,11 @@ function reportDesktop(spec) {
   console.log('  therefore no allowBuilds approval step.')
   console.log(`  Desktop and CLI share $DSH_HOME, so the synced settings and credentials`)
   console.log('  are the same documents on both.')
+  console.log('\n  A Desktop build whose plugin validator predates includePrerelease rejects')
+  console.log('  this spec outright (`requires @deepseek-ai/dsh-credentials@*, found')
+  console.log('  0.1.5-rc.2`). Quit the application, then patch the installed copy:')
+  console.log('\n    node scripts/patch-desktop-asar.mjs --app "<install directory>"\n')
+  console.log('  See "Older Desktop builds" in the README for the paths and the caveats.')
 }
 
 function main() {
