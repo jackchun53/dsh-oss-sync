@@ -23,7 +23,7 @@
  */
 
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { IconChevronDownOutline14, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconChevronDownOutline14, Tag, writeClipboard } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: brings the `ctx.slots` context merge.
@@ -398,6 +398,25 @@ const INPUT: CSSProperties = {
 }
 /** Shared inline style for a row of controls. */
 const ROW: CSSProperties = { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }
+/**
+ * The masked field's row. Chromium refuses to cut or copy out of an
+ * `input[type=password]`, so the two controls that lift that restriction sit
+ * beside the value they act on rather than in the action row below.
+ */
+const SECRET_ROW: CSSProperties = { display: 'flex', gap: '6px', alignItems: 'center' }
+/** A control narrow enough to ride beside an input. */
+const INLINE_CONTROL: CSSProperties = {
+  flex: 'none',
+  padding: '5px 8px',
+  font: 'inherit',
+  fontSize: '12px',
+  whiteSpace: 'nowrap',
+  color: 'var(--dsw-alias-label-secondary)',
+  background: 'var(--dsw-alias-bg-layer-1)',
+  border: '0.5px solid var(--dsw-alias-border-l4)',
+  borderRadius: '8px',
+  cursor: 'pointer',
+}
 
 /**
  * Render the sync card.
@@ -408,7 +427,35 @@ function OssSyncCard(props: OssSyncCardProps) {
   const state = props.useOssSyncCard(snapshot => snapshot)
   const [open, setOpen] = useState(false)
   const [hovered, setHovered] = useState(false)
+  // Reveal is a reading gesture, never a value change: the secret stays the
+  // secret, and only its masking is lifted.
+  const [revealed, setRevealed] = useState<readonly string[]>([])
+  const [copied, setCopied] = useState<{ field: string; ok: boolean } | undefined>(undefined)
   const saveStarted = useRef(false)
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  useEffect(() => () => { clearTimeout(copyTimer.current) }, [])
+
+  /** Reveal or re-mask one secret. */
+  const toggleReveal = (field: string): void => {
+    setRevealed(current => current.includes(field)
+      ? current.filter(name => name !== field)
+      : [...current, field])
+  }
+
+  /**
+   * Copy one field's current text through the host clipboard. A masked field is
+   * the one value the platform will not let a reader copy, so this affordance
+   * travels with exactly those fields — and never unmasks them to do it.
+   * @param field - the field being copied, for its own feedback.
+   * @param text - the text to place on the clipboard.
+   */
+  const copyField = (field: string, text: string): void => {
+    void writeClipboard(text).then((accepted) => {
+      setCopied({ field, ok: accepted })
+      clearTimeout(copyTimer.current)
+      copyTimer.current = setTimeout(() => { setCopied(undefined) }, 1600)
+    })
+  }
   // A provider that reports no bucket is local-only, which is the state the
   // card exists to end: actions have nothing to reach until one is saved.
   const unconfigured = Object.values(state.status).some(entry => entry.configured === false)
@@ -462,36 +509,63 @@ function OssSyncCard(props: OssSyncCardProps) {
           <div style={{ display: 'grid', gap: '8px', marginTop: '10px' }}>
             {FIELDS.map((entry) => {
               const draft = state.drafts[entry.field]
+              const text = draft ?? renderValue(state.values[entry.field])
+              const locked = !state.writable || state.saving
+              const control = (
+                <input
+                  id={`oss-sync-${entry.field}`}
+                  style={INPUT}
+                  // Only a masked field is re-typed; reveal keeps the same input
+                  // so the caret and the staged draft survive the toggle.
+                  type={entry.secret === true && !revealed.includes(entry.field) ? 'password' : 'text'}
+                  autoComplete={entry.secret === true ? 'new-password' : 'off'}
+                  disabled={locked}
+                  value={text}
+                  onChange={(event) => { props.edit(entry.field, event.target.value) }}
+                />
+              )
               return (
-                <label key={entry.field} htmlFor={`oss-sync-${entry.field}`}>
-                  <span style={LABEL}>
+                <div key={entry.field}>
+                  <label style={LABEL} htmlFor={`oss-sync-${entry.field}`}>
                     {entry.label}
                     {state.overridden[entry.field] === undefined ? null : <em style={HINT}> （已覆盖）</em>}
-                  </span>
+                  </label>
                   {entry.boolean === true ? (
                     <select
                       id={`oss-sync-${entry.field}`}
                       style={INPUT}
-                      disabled={!state.writable || state.saving}
-                      value={draft ?? renderValue(state.values[entry.field])}
+                      disabled={locked}
+                      value={text}
                       onChange={(event) => { props.edit(entry.field, event.target.value) }}
                     >
                       <option value="false">关闭（虚拟主机式，OSS / TOS / AWS）</option>
                       <option value="true">开启（路径式，部分 MinIO）</option>
                     </select>
-                  ) : (
-                    <input
-                      id={`oss-sync-${entry.field}`}
-                      style={INPUT}
-                      type={entry.secret === true ? 'password' : 'text'}
-                      autoComplete={entry.secret === true ? 'new-password' : 'off'}
-                      disabled={!state.writable || state.saving}
-                      value={draft ?? renderValue(state.values[entry.field])}
-                      onChange={(event) => { props.edit(entry.field, event.target.value) }}
-                    />
-                  )}
+                  ) : entry.secret === true ? (
+                    <div style={SECRET_ROW}>
+                      {control}
+                      <button
+                        type="button"
+                        style={INLINE_CONTROL}
+                        aria-label={`${revealed.includes(entry.field) ? '隐藏' : '显示'}：${entry.label}`}
+                        aria-pressed={revealed.includes(entry.field)}
+                        onClick={() => { toggleReveal(entry.field) }}
+                      >
+                        {revealed.includes(entry.field) ? '隐藏' : '显示'}
+                      </button>
+                      <button
+                        type="button"
+                        style={INLINE_CONTROL}
+                        aria-label={`复制：${entry.label}`}
+                        disabled={text === ''}
+                        onClick={() => { copyField(entry.field, text) }}
+                      >
+                        {copied?.field === entry.field ? (copied.ok ? '已复制' : '复制失败') : '复制'}
+                      </button>
+                    </div>
+                  ) : control}
                   <span style={HINT}>{entry.hint}</span>
-                </label>
+                </div>
               )
             })}
           </div>

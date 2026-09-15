@@ -10,8 +10,9 @@
  *
  * What it covers: the card is collapsed on arrival, opening it discloses the
  * fields and the controls, a staged edit is visible while collapsed, a
- * Host-confirmed save closes it again, and an unconfigured deployment says so
- * without being opened.
+ * Host-confirmed save closes it again, an unconfigured deployment says so
+ * without being opened, and the masked field can be revealed and copied
+ * through the host clipboard.
  *
  * Run with `node test/card.mjs` after `pnpm build`.
  */
@@ -211,12 +212,15 @@ function fakeScope(value, options = {}) {
 async function mountCard(value = {}, scopeOverrides = {}) {
   const react = fakeReact()
   const scope = fakeScope(value, scopeOverrides)
+  /** Text the card handed to the host clipboard, in order. */
+  const clipboard = []
   const module = await materialize({
     'react': react.api,
     'react/jsx-runtime': react.jsxRuntime,
     '@deepseek-ai/dsh-client-ui-primitives': {
       Tag: (props) => element('span', { 'data-tag': props.tone, children: props.children }),
       IconChevronDownOutline14: (props) => element('svg', { 'data-icon': 'chevron', ...props }),
+      writeClipboard: async (text) => { clipboard.push(text); return true },
     },
   })
   let registration
@@ -235,6 +239,7 @@ async function mountCard(value = {}, scopeOverrides = {}) {
   return {
     face,
     scope,
+    clipboard,
     render: () => react.render(registration.component, props),
   }
 }
@@ -288,5 +293,31 @@ assert.match(textOf(localOnly.render()), /仅本机/u, 'an unconfigured deployme
 const readOnly = await mountCard({}, { writable: false })
 assert.match(textOf(readOnly.render()), /只读/u, 'a read-only deployment should say so while collapsed')
 console.log('ok  card: an unconfigured or read-only deployment is legible while collapsed')
+
+// Chromium refuses to copy out of `input[type=password]`, so the masked field
+// carries both halves of the affordance: reveal it, or copy it without
+// unmasking it. Either way the value reaches the reader.
+const masked = await mountCard({ secretAccessKey: 'sk-live-secret' })
+let maskedTree = masked.render()
+headerOf(maskedTree).props.onClick()
+maskedTree = masked.render()
+const secretInput = (tree) => findAll(tree, 'input').find(input => input.props.id === 'oss-sync-secretAccessKey')
+const labelled = (tree, label) => findAll(tree, 'button').find(button => button.props['aria-label'] === label)
+assert.equal(secretInput(maskedTree).props.type, 'password', 'the secret should arrive masked')
+
+labelled(maskedTree, '显示：对象存储 AccessKey Secret').props.onClick()
+maskedTree = masked.render()
+assert.equal(secretInput(maskedTree).props.type, 'text', 'reveal should unmask the field')
+assert.match(textOf(maskedTree), /隐藏/u, 'the reveal control should offer to re-mask')
+console.log('ok  card: the masked field can be revealed in place')
+
+labelled(maskedTree, '复制：对象存储 AccessKey Secret').props.onClick()
+await settle()
+maskedTree = masked.render()
+assert.deepEqual(masked.clipboard, ['sk-live-secret'], 'copy should hand the stored secret to the host clipboard')
+assert.match(textOf(maskedTree), /已复制/u, 'copy should confirm itself'
+)
+assert.equal(secretInput(maskedTree).props.type, 'text', 'copy should not re-mask the field mid-read')
+console.log('ok  card: the masked field copies through the host clipboard')
 
 console.log('\nall card checks passed')

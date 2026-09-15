@@ -237,6 +237,13 @@ where the deployment is not writable, `等待宿主` before the Host has answere
 clicked, and a save the Host confirms closes the card again — a rejected one
 keeps its diagnostics, and its drafts, in view.
 
+`secretAccessKey` renders masked, and Chromium refuses to cut or copy out of a
+masked input — on every platform, by design. So that one field carries the two
+controls the platform withholds: **显示 / 隐藏** re-types the same input between
+`password` and `text` without touching the value or the staged draft, and
+**复制** hands the field's current text to the host clipboard. Copying a secret
+never unmasks it on screen.
+
 | Field | Meaning |
 |---|---|
 | `bucket`, `endpoint`, `region`, `forcePathStyle`, `accessKeyIdEnv`, `secretAccessKeyEnv` | Connection parameters; the entry config is the base layer, so an unset field keeps what `cordis.yml` and the environment supply. An endpoint without a URL scheme is normalized to `https://`. TOS/OSS/AWS use `forcePathStyle: false`; enable it only when a MinIO-compatible service requires it. |
@@ -329,6 +336,13 @@ synced document: it is the bootstrap credential.
 
 ## Known limitations
 
+- **A macOS Desktop shell without an Edit menu cannot copy from any text field.**
+  macOS delivers ⌘C and ⌘V as menu key equivalents, so an Electron application
+  menu built without `role: 'editMenu'` leaves cut, copy, paste, and select-all
+  dead across the whole interface — plugin cards included. Windows and Linux are
+  unaffected, because Chromium handles the Ctrl equivalents inside the renderer.
+  The card's **复制** control goes through `navigator.clipboard` rather than the
+  menu, so it is the one route a masked field has until that menu item exists.
 - **The settings page card is not verified on screen.** The browser half
   exists, is discovered, is served, and evaluates without error; `pnpm test:card`
   materializes the built bundle against a stubbed module table and asserts the

@@ -212,6 +212,11 @@ Governance 模式的 bucket 版本控制：正是它把一次误覆盖变成一�
 `只读`，宿主还没应答时显示 `等待宿主`，有未保存改动时显示 `未保存`。字段要点击表头才
 出现；宿主确认保存成功后卡片会重新收起，被拒绝的保存则把诊断和暂存的改动留在眼前。
 
+`secretAccessKey` 是掩码字段，而 Chromium 按设计禁止从掩码输入里剪切或复制（各平台
+一致）。所以这一个字段自带两项平台不肯给的能力：**显示 / 隐藏** 在 `password` 与 `text`
+之间切换同一个 input，既不动值也不动暂存的改动；**复制** 把该字段当前的文本交给宿主
+剪贴板。复制密钥不会把它在屏幕上显示出来。
+
 | 字段 | 含义 |
 |---|---|
 | `bucket`、`endpoint`、`region`、`forcePathStyle`、`accessKeyIdEnv`、`secretAccessKeyEnv` | 连接参数；条目配置是最底层，所以没填的字段保持 `cordis.yml` 和环境变量给的值。不带 URL scheme 的 endpoint 会被规范化为 `https://`。TOS/OSS/AWS 用 `forcePathStyle: false`；只有兼容 MinIO 的服务要求时才打开。 |
@@ -292,6 +297,12 @@ access key 本身必须来自机器的环境，绝不能来自同步文档：它
 
 ## 已知限制
 
+- **macOS 上缺 Edit 菜单的 Desktop 壳，连普通文本框也复制不了。** macOS 把 ⌘C/⌘V
+  当作菜单的 key equivalent 下发，所以一个不含 `role: 'editMenu'` 的自建 Electron
+  应用菜单会让剪切、复制、粘贴、全选整块失效——插件卡片也不例外。Windows/Linux 不受
+  影响，因为那里的 Ctrl+C 由 Chromium 在 renderer 内部处理。卡片里的 **复制** 走的是
+  `navigator.clipboard` 而不是菜单，所以在补上那个菜单项之前，它是掩码字段唯一能用
+  的复制路径。
 - **设置页卡片尚未在屏幕上验证过。** 浏览器那半边存在、能被发现、能被下发、求值
   也不报错；`pnpm test:card` 会把构建产物对着一个桩模块表物化出来，并据此断言卡片的
   标记和它的展开/收起行为；它背后的宿主那半边有 smoke 测试覆盖。这些都没覆盖到的是
