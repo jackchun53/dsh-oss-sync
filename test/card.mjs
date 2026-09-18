@@ -1,18 +1,18 @@
 /**
- * Behavioural check for the sync card, the browser half.
+ * Behavioural check for the sync section, the browser half.
  *
  * The bundle is a CommonJS factory the shell materializes against its frozen
  * module table, so this test materializes it the same way: a table holding the
- * nine words the shell seeds, a React stand-in carrying the three hooks the card
- * uses, and a JSX factory that records elements. No DOM, no react-dom, no jsdom
- * — the card's markup is asserted from those element records, and its
- * interaction is asserted by calling the handlers it rendered.
+ * nine words the shell seeds, a React stand-in carrying the three hooks the
+ * section uses, and a JSX factory that records elements. No DOM, no react-dom,
+ * no jsdom — the section's markup is asserted from those element records, and
+ * its interaction is asserted by calling the handlers it rendered.
  *
- * What it covers: the card is collapsed on arrival, opening it discloses the
- * fields and the controls, a staged edit is visible while collapsed, a
- * Host-confirmed save closes it again, an unconfigured deployment says so
- * without being opened, and the masked field can be revealed and copied
- * through the host clipboard.
+ * What it covers: the page view renders the fields and the controls directly,
+ * the summary view is the one-liner, a staged edit marks the section and a
+ * Host-confirmed save clears it, an unconfigured or read-only deployment says
+ * so in place, and the masked field can be revealed and copied through the
+ * host clipboard.
  *
  * Run with `node test/card.mjs` after `pnpm build`.
  */
@@ -85,14 +85,7 @@ function textOf(node) {
   return childrenOf(node).map(child => textOf(child)).join('')
 }
 
-/** The disclosure control: the only button carrying `aria-expanded`. */
-function headerOf(tree) {
-  const header = findAll(tree, 'button').find(button => button.props['aria-expanded'] !== undefined)
-  assert.ok(header !== undefined, 'the card should render a disclosure header')
-  return header
-}
-
-/** Every form control the card discloses. */
+/** Every form control the section renders. */
 function controlsOf(tree) {
   return [...findAll(tree, 'input'), ...findAll(tree, 'select')]
 }
@@ -203,8 +196,9 @@ function fakeScope(value, options = {}) {
 }
 
 /**
- * Mount the card the way the shell does: through the plugin's `apply`, against
- * a ctx stub, then render the registered component with the face it injected.
+ * Mount the section the way the shell does: through the plugin's `apply`,
+ * against a ctx stub, then render the registered component with the face it
+ * injected.
  * @param value - the settings namespace document to serve.
  * @param scopeOverrides - extra scope fields, such as `writable: false`.
  * @returns the rendered tree and the face, for driving interaction.
@@ -212,14 +206,13 @@ function fakeScope(value, options = {}) {
 async function mountCard(value = {}, scopeOverrides = {}) {
   const react = fakeReact()
   const scope = fakeScope(value, scopeOverrides)
-  /** Text the card handed to the host clipboard, in order. */
+  /** Text the section handed to the host clipboard, in order. */
   const clipboard = []
   const module = await materialize({
     'react': react.api,
     'react/jsx-runtime': react.jsxRuntime,
     '@deepseek-ai/dsh-client-ui-primitives': {
       Tag: (props) => element('span', { 'data-tag': props.tone, children: props.children }),
-      IconChevronDownOutline14: (props) => element('svg', { 'data-icon': 'chevron', ...props }),
       writeClipboard: async (text) => { clipboard.push(text); return true },
     },
   })
@@ -233,14 +226,16 @@ async function mountCard(value = {}, scopeOverrides = {}) {
     },
   }
   module.apply(ctx)
-  assert.ok(registration !== undefined, 'apply should register a settings.plugin.item card')
+  assert.ok(registration !== undefined, 'apply should register a plugins.bundle.config entry')
+  assert.equal(registration.spec.name, 'plugins.bundle.config', 'the section should register into the Plugins page')
+  assert.equal(registration.spec.key, 'dsh-oss-sync', 'the entry should key on the bundle\'s package name')
   const face = registration.spec.inject()
   const props = { ...face, useOssSyncCard: selector => selector(face.hooks.ossSyncCard.getSnapshot()) }
   return {
     face,
     scope,
     clipboard,
-    render: () => react.render(registration.component, props),
+    render: (view = 'page') => react.render(registration.component, { ...props, view }),
   }
 }
 
@@ -259,48 +254,39 @@ console.log(`ok  bundle: every require (${specifiers.join(', ')}) is in the shel
 
 const card = await mountCard()
 let tree = card.render()
-assert.equal(headerOf(tree).props['aria-expanded'], false, 'the card should arrive collapsed')
-assert.equal(controlsOf(tree).length, 0, 'a collapsed card should render no fields')
-assert.match(textOf(tree), /OSS 同步/u, 'a collapsed card should still name itself')
-console.log('ok  card: collapsed on arrival, with no fields rendered')
-
-headerOf(tree).props.onClick()
-tree = card.render()
-assert.equal(headerOf(tree).props['aria-expanded'], true, 'the header should open the card')
-assert.equal(controlsOf(tree).length, FIELDS, 'every field should appear once open')
+assert.equal(controlsOf(tree).length, FIELDS, 'the page view should render every field')
+assert.match(textOf(tree), /OSS 同步/u, 'the section should name itself')
 assert.match(textOf(tree), /保存/u, 'the controls should appear with the fields')
-console.log(`ok  card: the header discloses ${String(FIELDS)} fields and the controls`)
+console.log(`ok  section: the page view renders ${String(FIELDS)} fields and the controls`)
+
+tree = card.render('summary')
+assert.equal(controlsOf(tree).length, 0, 'the summary view should render no fields')
+assert.match(textOf(tree), /S3/u, 'the summary view should be the one-liner')
+console.log('ok  section: the summary view is the one-liner alone')
 
 card.face.edit('bucket', 'my-dsh')
 tree = card.render()
-assert.match(textOf(tree), /未保存/u, 'a staged edit should show while the card is open')
-headerOf(tree).props.onClick()
-tree = card.render()
-assert.equal(controlsOf(tree).length, 0, 'the card should close on a second click')
-assert.match(textOf(tree), /未保存/u, 'a staged edit should survive collapsing')
-console.log('ok  card: a staged edit is marked on the header and survives collapsing')
+assert.match(textOf(tree), /未保存/u, 'a staged edit should mark the section')
+console.log('ok  section: a staged edit is marked')
 
 card.face.save()
 await settle()
 tree = card.render()
-assert.equal(headerOf(tree).props['aria-expanded'], false, 'a confirmed save should close the card')
 assert.doesNotMatch(textOf(tree), /未保存/u, 'a confirmed save should clear the marker')
 assert.equal(card.scope.getSnapshot().value['bucket'], 'my-dsh', 'the save should reach the namespace')
-console.log('ok  card: a Host-confirmed save closes the card and clears the marker')
+console.log('ok  section: a Host-confirmed save clears the marker')
 
 const localOnly = await mountCard({ status: { settings: { configured: false } } })
-assert.match(textOf(localOnly.render()), /仅本机/u, 'an unconfigured deployment should say so while collapsed')
+assert.match(textOf(localOnly.render()), /仅本机/u, 'an unconfigured deployment should say so in place')
 const readOnly = await mountCard({}, { writable: false })
-assert.match(textOf(readOnly.render()), /只读/u, 'a read-only deployment should say so while collapsed')
-console.log('ok  card: an unconfigured or read-only deployment is legible while collapsed')
+assert.match(textOf(readOnly.render()), /只读/u, 'a read-only deployment should say so in place')
+console.log('ok  section: an unconfigured or read-only deployment is legible in place')
 
 // Chromium refuses to copy out of `input[type=password]`, so the masked field
 // carries both halves of the affordance: reveal it, or copy it without
 // unmasking it. Either way the value reaches the reader.
 const masked = await mountCard({ secretAccessKey: 'sk-live-secret' })
 let maskedTree = masked.render()
-headerOf(maskedTree).props.onClick()
-maskedTree = masked.render()
 const secretInput = (tree) => findAll(tree, 'input').find(input => input.props.id === 'oss-sync-secretAccessKey')
 const labelled = (tree, label) => findAll(tree, 'button').find(button => button.props['aria-label'] === label)
 assert.equal(secretInput(maskedTree).props.type, 'password', 'the secret should arrive masked')

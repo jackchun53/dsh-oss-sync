@@ -1,9 +1,10 @@
 /**
  * The sync card, browser half.
  *
- * `Settings → Plugins` dispatches one card per served settings namespace,
- * keyed by that namespace, so this file registers a card under `oss-sync` and
- * edits the namespace through the client settings scope. Configuration,
+ * The Plugins page dispatches one configuration section per bundle that
+ * registers into `plugins.bundle.config`, keyed by the bundle's package name,
+ * so this file registers a section under `dsh-oss-sync` and edits the
+ * `oss-sync` namespace through the client settings scope. Configuration,
  * runtime status, and the action buttons all ride that one scope: the host
  * publishes status into the same namespace, and a button writes the namespace's
  * request token.
@@ -11,19 +12,18 @@
  * Single-file on purpose. The host serves one built bundle per package, so a
  * relative import here would be a second module the browser never fetches.
  * Nothing here is a stylesheet either: the bundle has nowhere to put a CSS
- * module, so the card's chrome rides inline styles, and hover is spelled out as
- * state because an inline style carries no `:hover`.
+ * module, so the section's chrome rides inline styles.
  *
- * The card discloses in place, the way the Host's own plugin cards do: the
- * settings page lists one row per plugin, and which one a reader has open is a
- * reading gesture rather than a persisted setting. It starts closed, since the
- * fields are the tallest thing on the page and most visits never touch them.
+ * The section renders in place on the bundle's page, the way the Host's own
+ * configuration pages do: the page draws the title, the icon, and the crumb,
+ * and the form is the content the reader opened the page for. Leaving the
+ * page drops every staged edit, so the section discards them on unmount.
  *
  * @module dsh-oss-sync/client
  */
 
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { IconChevronDownOutline14, Tag, writeClipboard } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Tag, writeClipboard } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: brings the `ctx.slots` context merge.
@@ -33,8 +33,8 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: this package is not in the browser's baseline module table, and
 // the context merge plus the SettingsScope contract are all this half needs.
 import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
-// Type-only: the `settings.plugin.item` slot declaration and its owner props.
-import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
+// Type-only: the `plugins.bundle.config` slot declaration and its owner props.
+import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 
 /** The settings namespace this card edits; the host half registers it. */
 const NS = 'oss-sync'
@@ -100,6 +100,8 @@ interface StatusView {
 interface CardState {
   /** Whether the host answered with this namespace's descriptor. */
   ready: boolean
+  /** Whether the host exposes this namespace at all (memory mode never does). */
+  available: boolean
   /** Whether the host accepts writes for this namespace. */
   writable: boolean
   /** Staged text per field; a field with no draft shows the resolved value. */
@@ -160,12 +162,13 @@ interface OssSyncFace {
 }
 
 /** Props the renderer binds for this card. */
-type OssSyncCardProps = PropsRuntime<'settings.plugin.item'> & InjectFace<OssSyncFace>
+type OssSyncCardProps = PropsRuntime<'plugins.bundle.config'> & InjectFace<OssSyncFace>
 
 /** Bridges the `oss-sync` scope onto the card's staged form. */
 class CardController {
   private readonly snapshot = observable<CardState>({
     ready: false,
+    available: true,
     writable: false,
     drafts: {},
     dirty: false,
@@ -226,6 +229,7 @@ class CardController {
     }
     this.snapshot.set({
       ready: snapshot.status === 'ready',
+      available: snapshot.status !== 'unavailable',
       writable: snapshot.writable,
       drafts,
       dirty: Object.keys(drafts).length > 0,
@@ -300,73 +304,35 @@ function renderValue(value: unknown): string {
 }
 
 /**
- * Card chrome, in the tokens the settings page around it uses. Only
+ * Section chrome, in the tokens the Plugins page around it uses. Only
  * `--dsw-alias-*` follows the theme; the `--dsh-*` names this card used before
  * are not tokens, so every colour was silently its light-mode fallback.
  */
-const CARD: CSSProperties = {
-  listStyle: 'none',
-  border: '0.5px solid var(--dsw-alias-border-l4)',
-  borderRadius: '16px',
-  background: 'var(--dsw-alias-bg-layer-3)',
-  transition: 'border-color .16s, background .16s',
-}
-/** An open card reads as the one being worked on, not merely taller. */
-const CARD_OPEN: CSSProperties = {
-  background: 'var(--dsw-alias-bg-layer-2)',
-  borderColor: 'var(--dsw-alias-label-dimmed)',
-}
-/** The hover the neighbouring cards get from their stylesheet. */
-const CARD_HOVER: CSSProperties = { borderColor: 'var(--dsw-alias-label-dimmed)' }
-/** The whole header is the disclosure control, not just the chevron. */
-const HEADER: CSSProperties = {
-  appearance: 'none',
-  width: '100%',
-  border: 0,
-  background: 'none',
-  font: 'inherit',
-  color: 'inherit',
-  textAlign: 'left',
-  cursor: 'pointer',
-  display: 'flex',
-  alignItems: 'center',
-  gap: '12px',
-  padding: '14px 16px',
-  borderRadius: '12px',
-}
-/** Name over description, so two collapsed cards stay tellable apart. */
-const HEAD_TEXT: CSSProperties = {
-  flex: 1,
-  minWidth: 0,
+const SECTION: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
-  gap: '4px',
+  gap: '12px',
 }
-/** Card name. */
-const NAME: CSSProperties = {
-  fontSize: '15px',
-  fontWeight: 600,
-  lineHeight: 1.4,
+/** The section head: title beside the state tags, the page's own section pattern. */
+const SECTION_HEAD: CSSProperties = {
+  display: 'flex',
+  alignItems: 'baseline',
+  gap: '10px',
+}
+/** Section title, matching the page's own `sectionTitle`. */
+const SECTION_TITLE: CSSProperties = {
+  margin: 0,
+  fontSize: '14px',
+  lineHeight: '20px',
+  fontWeight: 500,
   color: 'var(--dsw-alias-label-primary)',
 }
-/** What this card's settings govern. */
+/** What this section's settings govern. */
 const DESCRIPTION: CSSProperties = {
+  margin: 0,
   fontSize: '13px',
   lineHeight: 1.5,
   color: 'var(--dsw-alias-label-tertiary)',
-}
-/** Rotation rides the wrapper: an icon takes `size` and `className`, not a style. */
-const CHEVRON: CSSProperties = {
-  flex: 'none',
-  display: 'inline-flex',
-  color: 'var(--dsw-alias-label-tertiary)',
-  transition: 'transform .16s',
-}
-/** The disclosed controls, separated from the header it sits under. */
-const BODY: CSSProperties = {
-  borderTop: '0.5px solid var(--dsw-alias-border-l2)',
-  margin: '0 16px',
-  paddingBottom: '8px',
 }
 /** Stated in the body so a read-only deployment is not a silently dead form. */
 const READ_ONLY: CSSProperties = {
@@ -419,21 +385,24 @@ const INLINE_CONTROL: CSSProperties = {
 }
 
 /**
- * Render the sync card.
- * @param props - the card snapshot and its actions.
- * @returns the card.
+ * Render the sync section.
+ * @param props - the view asked for, the card snapshot, and its actions.
+ * @returns the one-liner, or the form.
  */
 function OssSyncCard(props: OssSyncCardProps) {
   const state = props.useOssSyncCard(snapshot => snapshot)
-  const [open, setOpen] = useState(false)
-  const [hovered, setHovered] = useState(false)
   // Reveal is a reading gesture, never a value change: the secret stays the
   // secret, and only its masking is lifted.
   const [revealed, setRevealed] = useState<readonly string[]>([])
   const [copied, setCopied] = useState<{ field: string; ok: boolean } | undefined>(undefined)
-  const saveStarted = useRef(false)
   const copyTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
-  useEffect(() => () => { clearTimeout(copyTimer.current) }, [])
+  // Leaving the page drops every staged edit, so the form discards on unmount.
+  const discard = useRef(props.discard)
+  discard.current = props.discard
+  useEffect(() => () => {
+    clearTimeout(copyTimer.current)
+    discard.current()
+  }, [])
 
   /** Reveal or re-mask one secret. */
   const toggleReveal = (field: string): void => {
@@ -459,147 +428,126 @@ function OssSyncCard(props: OssSyncCardProps) {
   // A provider that reports no bucket is local-only, which is the state the
   // card exists to end: actions have nothing to reach until one is saved.
   const unconfigured = Object.values(state.status).some(entry => entry.configured === false)
-  // Settle on the Host's answer rather than on the click: a rejected save keeps
-  // its diagnostics and its retained drafts in view, where they can be fixed.
-  useEffect(() => {
-    if (state.saving) {
-      saveStarted.current = true
-      return
-    }
-    if (!saveStarted.current) return
-    saveStarted.current = false
-    if (!state.dirty && state.failure === undefined) setOpen(false)
-  }, [state.dirty, state.failure, state.saving])
+
+  if (props.view === 'summary') {
+    return <span>设置与密钥存放于 S3 兼容的存储桶，每台机器读取同一份文档。</span>
+  }
 
   // One badge, in the order a reader needs it: a card that cannot reach its
   // bucket matters more than one that is merely not writable from here.
   const badge = !state.ready ? '等待宿主' : unconfigured ? '仅本机' : state.writable ? undefined : '只读'
   return (
-    <li style={{ ...CARD, ...(open ? CARD_OPEN : {}), ...(hovered && !open ? CARD_HOVER : {}) }}>
-      <button
-        type="button"
-        style={HEADER}
-        aria-expanded={open}
-        aria-label={`${open ? '收起' : '展开'}：OSS 同步`}
-        onMouseEnter={() => { setHovered(true) }}
-        onMouseLeave={() => { setHovered(false) }}
-        onClick={() => { setOpen(!open) }}
-      >
-        <span style={HEAD_TEXT}>
-          <span style={NAME}>OSS 同步</span>
-          <span style={DESCRIPTION}>设置与密钥存放于 S3 兼容的存储桶，每台机器读取同一份文档。</span>
-        </span>
+    <div style={SECTION}>
+      <div style={SECTION_HEAD}>
+        <h4 style={SECTION_TITLE}>OSS 同步</h4>
         {badge === undefined ? null : <Tag tone={unconfigured ? 'warning' : 'quiet'}>{badge}</Tag>}
         {state.dirty ? <Tag tone="neutral">未保存</Tag> : null}
-        <span style={open ? { ...CHEVRON, transform: 'rotate(180deg)' } : CHEVRON}>
-          <IconChevronDownOutline14 />
-        </span>
-      </button>
+      </div>
+      <p style={DESCRIPTION}>设置与密钥存放于 S3 兼容的存储桶，每台机器读取同一份文档。</p>
 
-      {open ? (
-        <div style={BODY}>
-          {state.writable ? null : <p style={READ_ONLY} role="status">当前为只读：这个部署不接受设置写入。</p>}
+      {state.available ? null : (
+        <p style={READ_ONLY} role="status">宿主未提供此命名空间：这个部署的设置只留在本机。</p>
+      )}
+      {state.writable || !state.available ? null : <p style={READ_ONLY} role="status">当前为只读：这个部署不接受设置写入。</p>}
 
-          {unconfigured ? (
-            <p style={{ ...HINT, margin: '10px 0' }}>
-              尚未配置存储桶：在保存一个之前，设置与密钥只留在本机。保存时会以本机文档作为初始内容写入。
-            </p>
-          ) : null}
+      {unconfigured ? (
+        <p style={{ ...HINT, margin: 0 }}>
+          尚未配置存储桶：在保存一个之前，设置与密钥只留在本机。保存时会以本机文档作为初始内容写入。
+        </p>
+      ) : null}
 
-          <div style={{ display: 'grid', gap: '8px', marginTop: '10px' }}>
-            {FIELDS.map((entry) => {
-              const draft = state.drafts[entry.field]
-              const text = draft ?? renderValue(state.values[entry.field])
-              const locked = !state.writable || state.saving
-              const control = (
-                <input
+      <div style={{ display: 'grid', gap: '8px' }}>
+        {FIELDS.map((entry) => {
+          const draft = state.drafts[entry.field]
+          const text = draft ?? renderValue(state.values[entry.field])
+          const locked = !state.available || !state.writable || state.saving
+          const control = (
+            <input
+              id={`oss-sync-${entry.field}`}
+              style={INPUT}
+              // Only a masked field is re-typed; reveal keeps the same input
+              // so the caret and the staged draft survive the toggle.
+              type={entry.secret === true && !revealed.includes(entry.field) ? 'password' : 'text'}
+              autoComplete={entry.secret === true ? 'new-password' : 'off'}
+              disabled={locked}
+              value={text}
+              onChange={(event) => { props.edit(entry.field, event.target.value) }}
+            />
+          )
+          return (
+            <div key={entry.field}>
+              <label style={LABEL} htmlFor={`oss-sync-${entry.field}`}>
+                {entry.label}
+                {state.overridden[entry.field] === undefined ? null : <em style={HINT}> （已覆盖）</em>}
+              </label>
+              {entry.boolean === true ? (
+                <select
                   id={`oss-sync-${entry.field}`}
                   style={INPUT}
-                  // Only a masked field is re-typed; reveal keeps the same input
-                  // so the caret and the staged draft survive the toggle.
-                  type={entry.secret === true && !revealed.includes(entry.field) ? 'password' : 'text'}
-                  autoComplete={entry.secret === true ? 'new-password' : 'off'}
                   disabled={locked}
                   value={text}
                   onChange={(event) => { props.edit(entry.field, event.target.value) }}
-                />
-              )
-              return (
-                <div key={entry.field}>
-                  <label style={LABEL} htmlFor={`oss-sync-${entry.field}`}>
-                    {entry.label}
-                    {state.overridden[entry.field] === undefined ? null : <em style={HINT}> （已覆盖）</em>}
-                  </label>
-                  {entry.boolean === true ? (
-                    <select
-                      id={`oss-sync-${entry.field}`}
-                      style={INPUT}
-                      disabled={locked}
-                      value={text}
-                      onChange={(event) => { props.edit(entry.field, event.target.value) }}
-                    >
-                      <option value="false">关闭（虚拟主机式，OSS / TOS / AWS）</option>
-                      <option value="true">开启（路径式，部分 MinIO）</option>
-                    </select>
-                  ) : entry.secret === true ? (
-                    <div style={SECRET_ROW}>
-                      {control}
-                      <button
-                        type="button"
-                        style={INLINE_CONTROL}
-                        aria-label={`${revealed.includes(entry.field) ? '隐藏' : '显示'}：${entry.label}`}
-                        aria-pressed={revealed.includes(entry.field)}
-                        onClick={() => { toggleReveal(entry.field) }}
-                      >
-                        {revealed.includes(entry.field) ? '隐藏' : '显示'}
-                      </button>
-                      <button
-                        type="button"
-                        style={INLINE_CONTROL}
-                        aria-label={`复制：${entry.label}`}
-                        disabled={text === ''}
-                        onClick={() => { copyField(entry.field, text) }}
-                      >
-                        {copied?.field === entry.field ? (copied.ok ? '已复制' : '复制失败') : '复制'}
-                      </button>
-                    </div>
-                  ) : control}
-                  <span style={HINT}>{entry.hint}</span>
+                >
+                  <option value="false">关闭（虚拟主机式，OSS / TOS / AWS）</option>
+                  <option value="true">开启（路径式，部分 MinIO）</option>
+                </select>
+              ) : entry.secret === true ? (
+                <div style={SECRET_ROW}>
+                  {control}
+                  <button
+                    type="button"
+                    style={INLINE_CONTROL}
+                    aria-label={`${revealed.includes(entry.field) ? '隐藏' : '显示'}：${entry.label}`}
+                    aria-pressed={revealed.includes(entry.field)}
+                    onClick={() => { toggleReveal(entry.field) }}
+                  >
+                    {revealed.includes(entry.field) ? '隐藏' : '显示'}
+                  </button>
+                  <button
+                    type="button"
+                    style={INLINE_CONTROL}
+                    aria-label={`复制：${entry.label}`}
+                    disabled={text === ''}
+                    onClick={() => { copyField(entry.field, text) }}
+                  >
+                    {copied?.field === entry.field ? (copied.ok ? '已复制' : '复制失败') : '复制'}
+                  </button>
                 </div>
-              )
-            })}
-          </div>
-
-          <div style={ROW}>
-            <button type="button" disabled={!state.dirty || state.saving} onClick={() => { props.save() }}>
-              {state.saving ? '保存中…' : '保存'}
-            </button>
-            <button type="button" disabled={!state.dirty || state.saving} onClick={() => { props.discard() }}>
-              放弃
-            </button>
-            <button type="button" disabled={!state.ready || unconfigured} onClick={() => { props.action('pull') }}>
-              立即同步
-            </button>
-            <button type="button" disabled={!state.ready || unconfigured} onClick={() => { props.action('push') }}>
-              强制推送
-            </button>
-          </div>
-
-          {state.failure === undefined ? null : (
-            <p style={{ ...HINT, color: 'var(--dsw-alias-state-error-primary)' }}>{state.failure}</p>
-          )}
-
-          {(['settings', 'credentials'] as const).map(label => (
-            <div key={label} style={{ marginTop: '10px' }}>
-              <span style={LABEL}>{label === 'settings' ? '设置' : '密钥'}</span>
-              <span style={HINT}>
-                {describeStatus(state.status[label])}
-              </span>
+              ) : control}
+              <span style={HINT}>{entry.hint}</span>
             </div>
-          ))}
+          )
+        })}
+      </div>
+
+      <div style={ROW}>
+        <button type="button" disabled={!state.dirty || state.saving} onClick={() => { props.save() }}>
+          {state.saving ? '保存中…' : '保存'}
+        </button>
+        <button type="button" disabled={!state.dirty || state.saving} onClick={() => { props.discard() }}>
+          放弃
+        </button>
+        <button type="button" disabled={!state.ready || unconfigured} onClick={() => { props.action('pull') }}>
+          立即同步
+        </button>
+        <button type="button" disabled={!state.ready || unconfigured} onClick={() => { props.action('push') }}>
+          强制推送
+        </button>
+      </div>
+
+      {state.failure === undefined ? null : (
+        <p style={{ ...HINT, color: 'var(--dsw-alias-state-error-primary)' }}>{state.failure}</p>
+      )}
+
+      {(['settings', 'credentials'] as const).map(label => (
+        <div key={label}>
+          <span style={LABEL}>{label === 'settings' ? '设置' : '密钥'}</span>
+          <span style={HINT}>
+            {describeStatus(state.status[label])}
+          </span>
         </div>
-      ) : null}
-    </li>
+      ))}
+    </div>
   )
 }
 
@@ -639,12 +587,13 @@ export const inject = ['slots', 'settingsScope']
 export function apply(ctx: ClientContext): void {
   const controller = new CardController(ctx.settingsScope.bind({ namespace: NS }))
   ctx.effect(() => () => { controller.dispose() }, 'dsh-oss-sync: card controller')
-  // The tab declares this slot; registering before it exists would throw, and
-  // this deployment may load either half first.
-  ctx.slots.inject('settings.plugin.item', function* () {
+  // The Plugins page declares this slot; registering before it exists would
+  // throw, and this deployment may load either half first. The key is the
+  // bundle's package name — the page renders the entry on that bundle's page.
+  ctx.slots.inject('plugins.bundle.config', function* () {
     yield ctx.slots.register({
-      name: 'settings.plugin.item',
-      key: NS,
+      name: 'plugins.bundle.config',
+      key: 'dsh-oss-sync',
       inject: () => controller.inject(),
     }, OssSyncCard)
   })

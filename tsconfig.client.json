@@ -31,8 +31,8 @@
       "@deepseek-ai/dsh-client-ui-settings/client": [
         "../deepseek-harness/packages/client/ui-settings/lib/types/client/index.d.ts"
       ],
-      "@deepseek-ai/dsh-client-ui-settings-plugins/client": [
-        "../deepseek-harness/packages/client/ui-settings-plugins/lib/types/client/index.d.ts"
+      "@deepseek-ai/dsh-client-ui-plugin-manager/client": [
+        "../deepseek-harness/packages/client/ui-plugin-manager/lib/types/client/index.d.ts"
       ],
       "@deepseek-ai/dsh-client-ui-renderer/client": [
         "../deepseek-harness/packages/client/ui-renderer/lib/types/client/index.d.ts"

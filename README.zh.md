@@ -21,21 +21,21 @@
 dsh plugin --profile web add dsh-oss-sync
 
 # 2. 指向某个 bucket —— 既可以在启动界面的环境里给，也可以启动后在
-#    Settings → Plugins 里填，两者是同一份配置
+#    插件管理页里填，两者是同一份配置
 export DSH_SYNC_BUCKET=my-dsh
 export DSH_SYNC_ENDPOINT=https://oss-cn-shanghai.aliyuncs.com   # AWS 可省略
 export DSH_SYNC_REGION=cn-shanghai
 
-# 3. 重启，然后打开 Settings → Plugins
+# 3. 重启，然后打开 Plugins → dsh-oss-sync
 ```
 
 此后每台装了该插件包、并读到同一个 bucket 的机器，都共享这两份文档。配置第二台
 机器就是同样这三步 —— 配置本身已经在 bucket 里了。
 
 没有 bucket 也能正常起来：provider 以纯本地模式运行，每个命名空间都从本机缓存的
-那份文档解析，不读也不写任何服务，卡片就是你填连接的地方。首次启动时会先把
+那份文档解析，不读也不写任何服务，配置区块就是你填连接的地方。首次启动时会先把
 `settings.yaml` 和 `.credentials.yaml` 导入到那份缓存，然后才停用基于文件的行。
-之后在卡片里保存一个 bucket，会拿本机持有的整份文档去初始化它，所以已有的模型
+之后在配置区块里保存一个 bucket，会拿本机持有的整份文档去初始化它，所以已有的模型
 provider API Key，以及 bucket 存在之前手填过的任何东西，都不会丢。
 
 ## 安装
@@ -108,7 +108,7 @@ Desktop 和 CLI 共用 `$DSH_HOME`，所以两个界面读的是同样这两份�
 离线缓存。
 
 Desktop 启动不需要任何环境变量：没有 bucket 时 provider 以纯本地模式运行，应用
-照常启动，连接就在 `Settings → Plugins` 里配置。`setx DSH_SYNC_BUCKET ...` 也仍然
+照常启动，连接就在该插件的插件管理页里配置。`setx DSH_SYNC_BUCKET ...` 也仍然
 可用，但它只是引导用的默认值，不是前置条件。注意 `DSH_*` 这类名字不能来自
 `.env` 文件 —— harness 把整个前缀都当作启动环境专属。
 
@@ -166,20 +166,20 @@ PowerShell 里这个变量写作 `$env:LOCALAPPDATA`；如果安装时改过目�
 ### 环境变量
 
 provider 在每次启动时从启动环境里读连接信息，所以一份已安装的包可以服务所有
-机器。这里的每个值都只是引导默认值：没设就是没有，设置卡片在你于其中填写之前
+机器。这里的每个值都只是引导默认值：没设就是没有，配置区块在你于其中填写之前
 不会把它写进存储。
 
 | 变量 | 含义 |
 |---|---|
-| `DSH_SYNC_BUCKET` | 存放文档的 bucket。不设则 provider 以纯本地模式启动；在这里设，或在设置卡片里设。 |
+| `DSH_SYNC_BUCKET` | 存放文档的 bucket。不设则 provider 以纯本地模式启动；在这里设，或在配置区块里设。 |
 | `DSH_SYNC_ENDPOINT` | 兼容 S3 的 endpoint（MinIO、Ceph、COS）；AWS 可省略。 |
 | `DSH_SYNC_REGION` | 签名用 region；默认 `us-east-1`。 |
 | `DSH_SYNC_PREFIX` | Key 前缀；默认 `dsh-sync`。 |
 | `DSH_SYNC_FORCE_PATH_STYLE` | 只有要求 path-style 寻址的服务（常见于 MinIO）才设为 `true`。默认使用 virtual-hosted 风格，TOS、OSS、AWS 都要求这种风格。 |
 | `DSH_SYNC_POLL_MS` | 轮询间隔，毫秒；默认 `30000`。 |
-| `DSH_SYNC_ACCESS_KEY_ID` / `DSH_SYNC_SECRET_ACCESS_KEY` | bucket 的静态凭证；不设则回退到设置卡片保存的那一对，再回退到 SDK 自己的链条（`AWS_ACCESS_KEY_ID`、profile、实例角色）。 |
+| `DSH_SYNC_ACCESS_KEY_ID` / `DSH_SYNC_SECRET_ACCESS_KEY` | bucket 的静态凭证；不设则回退到配置区块保存的那一对，再回退到 SDK 自己的链条（`AWS_ACCESS_KEY_ID`、profile、实例角色）。 |
 
-卡片保存的那一对优先级高于环境变量，环境变量又高于 SDK 链条。三者之中只有卡片
+配置区块保存的那一对优先级高于环境变量，环境变量又高于 SDK 链条。三者之中只有配置区块
 里的那一对永远不会离开本机。
 
 ### 按 profile 覆盖
@@ -201,16 +201,16 @@ provider 在每次启动时从启动环境里读连接信息，所以一份已�
 bucket 必须在 `PutObject` 上支持 `If-Match` 和 `If-None-Match`。强烈建议开启
 Governance 模式的 bucket 版本控制：正是它把一次误覆盖变成一次可恢复的版本。
 
-### 设置页卡片
+### 配置区块
 
-设置页通过一个注册好的设置命名空间（`oss-sync`）来读写同步，因为接缝本来就会把
+插件管理页通过一个注册好的设置命名空间（`oss-sync`）来读写同步，因为接缝本来就会把
 实时值带到浏览器：命名空间在每次 commit 时重新解析，客户端的镜像会把它转发出去。
 不需要第二条通道。
 
-卡片默认收起。`Settings → Plugins` 是一个插件一行的列表，所以表头直接写明是哪张卡片、
-它管什么，以及不展开也能看到的状态：保存 bucket 之前显示 `仅本机`，部署不可写时显示
-`只读`，宿主还没应答时显示 `等待宿主`，有未保存改动时显示 `未保存`。字段要点击表头才
-出现；宿主确认保存成功后卡片会重新收起，被拒绝的保存则把诊断和暂存的改动留在眼前。
+打开该插件的页面 —— **Plugins → dsh-oss-sync** —— 配置区块就位于描述与组件列表之间，
+按页面自己的区块样式命名并带状态标记：保存 bucket 之前显示 `仅本机`，部署不可写时显示
+`只读`，宿主还没应答时显示 `等待宿主`，有未保存改动时显示 `未保存`。离开页面会丢掉
+所有暂存的改动；被拒绝的保存则把诊断和暂存的改动留在眼前。
 
 `secretAccessKey` 是掩码字段，而 Chromium 按设计禁止从掩码输入里剪切或复制（各平台
 一致）。所以这一个字段自带两项平台不肯给的能力：**显示 / 隐藏** 在 `password` 与 `text`
@@ -303,10 +303,10 @@ access key 本身必须来自机器的环境，绝不能来自同步文档：它
   影响，因为那里的 Ctrl+C 由 Chromium 在 renderer 内部处理。卡片里的 **复制** 走的是
   `navigator.clipboard` 而不是菜单，所以在补上那个菜单项之前，它是掩码字段唯一能用
   的复制路径。
-- **设置页卡片尚未在屏幕上验证过。** 浏览器那半边存在、能被发现、能被下发、求值
-  也不报错；`pnpm test:card` 会把构建产物对着一个桩模块表物化出来，并据此断言卡片的
-  标记和它的展开/收起行为；它背后的宿主那半边有 smoke 测试覆盖。这些都没覆盖到的是
-  CSS：还没有一次运行确认过卡片在浏览器里的渲染，所以那个布局只能算未证实。
+- **配置区块尚未在屏幕上验证过。** 浏览器那半边存在、能被发现、能被下发、求值
+  也不报错；`pnpm test:card` 会把构建产物对着一个桩模块表物化出来，并据此断言区块的
+  标记；它背后的宿主那半边有 smoke 测试覆盖。这些都没覆盖到的是
+  CSS：还没有一次运行确认过区块在浏览器里的渲染，所以那个布局只能算未证实。
 - **没有 `.env` 回退。** `dsh-credentials-local` 会依次叠加进程环境、存储文件、
   `<cwd>/.env` 和 `$DSH_HOME/.env`。本 provider 只叠加环境和 bucket。以前放在
   `.env` 里的值请放进存储，或者继续导出它们。
@@ -347,7 +347,7 @@ harness 自身的加载规则有两个后果塑造了本包的结构，这也是
 pnpm install
 pnpm build          # tsc → lib/，再 esbuild → lib/client.js
 pnpm smoke          # 假 S3 的端到端检查
-pnpm test:card      # 浏览器端卡片，跑在桩模块表上
+pnpm test:card      # 浏览器端区块，跑在桩模块表上
 pnpm test:patch     # asar 补丁工具，跑在内存里合成的归档上
 ```
 

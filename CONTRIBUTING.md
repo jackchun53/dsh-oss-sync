@@ -107,8 +107,8 @@ shell's frozen module table (`packages/client/web/src/seed.ts`: React and its
 JSX runtime, cordis, the store, and the slots, primitives, and dockkit
 packages), and the factory's `require` resolves against exactly that table —
 anything else throws at materialization, in the browser, with no build-time
-warning. Adding `@deepseek-ai/dsh-client-ui-primitives` to the card is what makes
-the disclosure header share the Host's own chevron and tag; `pnpm test:card`
+warning. Adding `@deepseek-ai/dsh-client-ui-primitives` to the section is what
+lets it share the Host's own tag; `pnpm test:card`
 fails if a require ever leaves the table, and `tsconfig.client.json` needs a
 `paths` entry per added package so the half still type-checks.
 
@@ -119,7 +119,7 @@ into a sibling `deepseek-harness` checkout's built declarations
 sibling path there, or add real dependencies, before publishing. The client half
 also type-checks against the harness's client packages, which is why
 `tsconfig.client.json` lists `ui-slots`, `ui-primitives`, `ui-settings`,
-`ui-settings-plugins`, and `ui-renderer` as well.
+`ui-plugin-manager`, and `ui-renderer` as well.
 
 `lib/` is what the loader loads: rebuild after every source change, then restart
 the profile. When running the harness from source (`pnpm dsh` from the checkout,
@@ -154,13 +154,13 @@ archive is refused without leaving a backup beside it.
 
 `pnpm test:card` materializes `lib/client.js` the way the shell does — through
 `window.__ModuleLoader__`, against a table of the nine seeded words, with a React
-stand-in carrying the three hooks the card calls — and drives the card from the
-element records that produces: collapsed on arrival, fields and controls on open,
-a staged edit marked on the header and surviving a collapse, a Host-confirmed
-save closing it again, and an unconfigured or read-only deployment legible
-without opening it. It needs no DOM and no browser, and it fails if a require
-leaves the shell's module table — the mistake a new import in the browser half is
-most likely to make.
+stand-in carrying the three hooks the section calls — and drives it from the
+element records that produces: the page view renders the fields and controls
+directly, the summary view is the one-liner alone, a staged edit marks the
+section and a Host-confirmed save clears it, and an unconfigured or read-only
+deployment is legible in place. It needs no DOM and no browser, and it fails if
+a require leaves the shell's module table — the mistake a new import in the
+browser half is most likely to make.
 
 ## Layout
 

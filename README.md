@@ -23,12 +23,12 @@ through `ctx.credentials`, and `agent-default-model`, `llm-pi-ai`, and
 dsh plugin --profile web add dsh-oss-sync
 
 # 2. point it at a bucket — either in the environment the surface launches from,
-#    or afterwards in Settings → Plugins, which is the same document
+#    or afterwards on the bundle's Plugins page, which is the same document
 export DSH_SYNC_BUCKET=my-dsh
 export DSH_SYNC_ENDPOINT=https://oss-cn-shanghai.aliyuncs.com   # omit for AWS
 export DSH_SYNC_REGION=cn-shanghai
 
-# 3. restart, then open Settings → Plugins
+# 3. restart, then open Plugins → dsh-oss-sync
 ```
 
 Every machine that installs the bundle and reads the same bucket then shares
@@ -37,7 +37,7 @@ configuration is already in the bucket.
 
 Without a bucket the surfaces still start: the providers run local-only, every
 namespace resolves from this machine's own cached document, nothing is read or
-written to a service, and the card is where you supply one. On the first boot,
+written to a service, and the configuration section is where you supply one. On the first boot,
 `settings.yaml` and `.credentials.yaml` are imported into that cache before the
 file-backed rows are retired. Saving a bucket there then seeds it from the
 whole document this machine holds, so existing model-provider API keys and
@@ -119,8 +119,8 @@ Desktop and CLI share `$DSH_HOME`, so both surfaces read the same two synced
 documents and the same offline cache.
 
 Desktop needs no environment variable to start: with no bucket the providers
-run local-only, the application boots, and `Settings → Plugins` is where the
-connection is configured. `setx DSH_SYNC_BUCKET ...` still works, but it is a
+run local-only, the application boots, and the bundle's Plugins page is where
+the connection is configured. `setx DSH_SYNC_BUCKET ...` still works, but it is a
 bootstrap default, not a precondition. Note that `DSH_*` names cannot come from
 a `.env` file — the harness treats the whole prefix as launch-environment-only.
 
@@ -185,21 +185,21 @@ notarization.
 
 The providers read their connection from the launching environment on every
 surface, so one installed package serves every machine. Every value here is a
-bootstrap default: an unset one is simply absent, and the settings card omits
+bootstrap default: an unset one is simply absent, and the configuration section omits
 it from storage until you set it there.
 
 | Variable | Meaning |
 |---|---|
-| `DSH_SYNC_BUCKET` | Bucket holding the documents. Unset starts the providers local-only; set it here or in the settings card. |
+| `DSH_SYNC_BUCKET` | Bucket holding the documents. Unset starts the providers local-only; set it here or in the configuration section. |
 | `DSH_SYNC_ENDPOINT` | S3-compatible endpoint (MinIO, Ceph, COS); omit for AWS. |
 | `DSH_SYNC_REGION` | Region for the signature; defaults to `us-east-1`. |
 | `DSH_SYNC_PREFIX` | Key prefix; defaults to `dsh-sync`. |
 | `DSH_SYNC_FORCE_PATH_STYLE` | Set to `true` only for services that require path-style addressing (commonly MinIO). Defaults to virtual-hosted style, which TOS, OSS, and AWS require. |
 | `DSH_SYNC_POLL_MS` | Poll interval in milliseconds; defaults to `30000`. |
-| `DSH_SYNC_ACCESS_KEY_ID` / `DSH_SYNC_SECRET_ACCESS_KEY` | Static credentials for the bucket; unset falls back to the pair saved in the settings card, then to the SDK's own chain (`AWS_ACCESS_KEY_ID`, a profile, an instance role). |
+| `DSH_SYNC_ACCESS_KEY_ID` / `DSH_SYNC_SECRET_ACCESS_KEY` | Static credentials for the bucket; unset falls back to the pair saved in the configuration section, then to the SDK's own chain (`AWS_ACCESS_KEY_ID`, a profile, an instance role). |
 
-The pair the card saves wins over the environment, and the environment wins over
-the SDK chain. The card's pair is the only one of the three that never leaves
+The pair the section saves wins over the environment, and the environment wins over
+the SDK chain. The section's pair is the only one of the three that never leaves
 the machine.
 
 ### Per-profile overrides
@@ -222,20 +222,19 @@ The bucket must support `If-Match` and `If-None-Match` on `PutObject`.
 Governance-mode bucket versioning is strongly recommended: it is what turns a
 mistaken overwrite into a recoverable revision.
 
-### The settings-page card
+### The configuration section
 
-The settings page reads and drives the sync through one registered settings
+The Plugins page reads and drives the sync through one registered settings
 namespace (`oss-sync`), because the seam already carries live values to the
 browser: a namespace re-resolves on every commit and the client mirror forwards
 it. No second channel was needed.
 
-The card arrives collapsed. `Settings → Plugins` is a list of one row per plugin,
-so the header names this one, says what its settings govern, and carries the
-state a reader needs without opening it: `仅本机` until a bucket is saved, `只读`
-where the deployment is not writable, `等待宿主` before the Host has answered, and
-`未保存` while an edit is staged. The fields appear only once the header is
-clicked, and a save the Host confirms closes the card again — a rejected one
-keeps its diagnostics, and its drafts, in view.
+Open the bundle's page — **Plugins → dsh-oss-sync** — and the configuration
+section sits between the description and the row list, named and tagged the
+way the page's own sections are: `仅本机` until a bucket is saved, `只读`
+where the deployment is not writable, `等待宿主` before the Host has answered,
+and `未保存` while an edit is staged. Leaving the page drops every staged
+edit; a rejected save keeps its diagnostics, and its drafts, in view.
 
 `secretAccessKey` renders masked, and Chromium refuses to cut or copy out of a
 masked input — on every platform, by design. So that one field carries the two
@@ -343,12 +342,12 @@ synced document: it is the bootstrap credential.
   unaffected, because Chromium handles the Ctrl equivalents inside the renderer.
   The card's **复制** control goes through `navigator.clipboard` rather than the
   menu, so it is the one route a masked field has until that menu item exists.
-- **The settings page card is not verified on screen.** The browser half
+- **The configuration section is not verified on screen.** The browser half
   exists, is discovered, is served, and evaluates without error; `pnpm test:card`
   materializes the built bundle against a stubbed module table and asserts the
-  card's markup and its disclosure from that; and the host half behind it is
-  covered by the smoke test. What none of those cover is CSS: no run has
-  confirmed how the card renders in a browser, so treat its layout as unproven.
+  section's markup from that; and the host half behind it is covered by the
+  smoke test. What none of those cover is CSS: no run has confirmed how the
+  section renders in a browser, so treat its layout as unproven.
 - **No `.env` fallback.** `dsh-credentials-local` layers the process
   environment, the stored file, `<cwd>/.env`, and `$DSH_HOME/.env`. This
   provider layers the environment and the bucket only. Put values that used to

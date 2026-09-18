@@ -1,7 +1,7 @@
 {
   "name": "dsh-oss-sync",
   "version": "0.1.8",
-  "description": "Object-storage providers for the DeepSeek Harness settings and credential seams, with a settings-page card",
+  "description": "Object-storage providers for the DeepSeek Harness settings and credential seams, with a Plugins-page configuration section",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -71,7 +71,7 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-settings-plugins"
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
       ]
     }
   },
