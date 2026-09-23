@@ -17,7 +17,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { parse as parseYaml } from 'yaml'
 import { startFakeS3 } from './fake-s3.mjs'
-import { FakeSettings } from './fake-settings.mjs'
+import { FakeHmr, FakeSettings } from './fake-settings.mjs'
 import OssSettingsSync from '../lib/settings.js'
 import OssCredentialProvider from '../lib/credentials.js'
 import { ObjectStore, PreconditionFailedError } from '../lib/store.js'
@@ -327,6 +327,40 @@ try {
   assert.equal(service.objects.get('dsh-sync/probe.yaml'), 'second\n', 'the refused write changed nothing')
   store.destroy()
   console.log('ok  store: a stale revision is refused with PreconditionFailedError')
+
+  // ── enabled from the Plugins page, inside an HMR transaction ───────────────
+  const seed = new ObjectStore(resolveConfig(machineConfig(join(root, 'hmr-seed'), 'hmr-sync')))
+  const seedEnvelope = (rev, theme) => encodeEnvelope({
+    v: 1, rev, writer: 'other-machine', updatedAt: new Date().toISOString(), doc: { 'ui-theme': { theme } },
+  })
+  await seed.write('hmr-sync/settings.yaml', seedEnvelope(1, 'from-bucket'), { ifNoneMatch: true })
+  const hmrCtx = new Context()
+  await hmrCtx.plugin(FakeHmr)
+  const hmrSettings = hmrCtx.plugin(FakeSettings, { entries: profileEntries() })
+  await hmrSettings
+  let hmrFiber
+  // The plugin manager enables a plugin inside `hmr.runExclusive`, so the
+  // start, the poll timer, and every promise they chain inherit its flag.
+  await hmrCtx.get('hmr').runExclusive(async () => {
+    hmrFiber = hmrCtx.plugin(OssSettingsSync, { ...machineConfig(join(root, 'hmr'), 'hmr-sync'), pollMs: 1000 })
+    await hmrFiber
+  })
+  cleanups.push(async () => {
+    await hmrFiber.dispose()
+    await hmrSettings.dispose()
+  })
+  await hmrCtx.ossSyncControl.whenStarted
+  const hmrStatus = () => hmrFiber.config.status.get()?.settings
+  assert.equal(hmrStatus().lastError, undefined, 'the first sync after enabling applies without a nesting error')
+  assert.deepEqual(hmrCtx.settings.user('ui-theme'), { theme: 'from-bucket' })
+  const seeded = await seed.read('hmr-sync/settings.yaml')
+  await seed.write('hmr-sync/settings.yaml', seedEnvelope(2, 'from-poll'), { ifMatch: seeded.etag })
+  seed.destroy()
+  await waitFor(() => hmrCtx.settings.user('ui-theme')?.theme === 'from-poll' || hmrStatus().lastError !== undefined,
+    'the poll started inside the transaction to apply')
+  assert.equal(hmrStatus().lastError, undefined, 'a poll tick started inside the transaction applies too')
+  assert.deepEqual(hmrCtx.settings.user('ui-theme'), { theme: 'from-poll' })
+  console.log('ok  settings: enabled inside an HMR transaction, the sync still writes the profile')
 
   // ── credentials: first install imports the file store this bundle replaces ─
   await writeFile(join(home, '.credentials.yaml'), [

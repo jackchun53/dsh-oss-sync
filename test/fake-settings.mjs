@@ -9,7 +9,30 @@
  * the rest.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { Service } from '@deepseek-ai/cordis'
+
+/**
+ * A stand-in for Harness's HMR service, reduced to the transaction queue the
+ * settings service writes through: `runExclusive` serializes callers and
+ * refuses to nest, detecting nesting with an AsyncLocalStorage flag exactly as
+ * `@deepseek-ai/dsh-hmr` does. That flag leaks into every timer and promise a
+ * transaction creates, which is what the sync must cope with.
+ */
+export class FakeHmr extends Service {
+  constructor(ctx) {
+    super(ctx, 'hmr')
+    this.executing = new AsyncLocalStorage()
+    this.operations = Promise.resolve()
+  }
+
+  runExclusive(operation) {
+    if (this.executing.getStore()) return Promise.reject(new Error('HMR transactions cannot be nested'))
+    const task = this.operations.then(() => this.executing.run(true, operation))
+    this.operations = task.catch(() => {})
+    return task
+  }
+}
 
 /** Whether a value is a plain mapping. */
 function isMapping(value) {
@@ -82,11 +105,17 @@ export class FakeSettings extends Service {
   }
 
   async update(ns, patch, expectedRevision) {
-    this.write('update', ns, patch, expectedRevision, current => merge(current, patch))
+    await this.exclusive(() => this.write('update', ns, patch, expectedRevision, current => merge(current, patch)))
   }
 
   async replace(ns, section, expectedRevision) {
-    this.write('replace', ns, section, expectedRevision, () => structuredClone(section))
+    await this.exclusive(() => this.write('replace', ns, section, expectedRevision, () => structuredClone(section)))
+  }
+
+  /** Fence a write with the HMR queue when one is mounted, as the configuration editor does. */
+  exclusive(write) {
+    const hmr = this.owner.get('hmr')
+    return hmr === undefined ? write() : hmr.runExclusive(async () => write())
   }
 
   write(mode, ns, input, expected, change) {

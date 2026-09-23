@@ -129,6 +129,19 @@ export declare class OssSettingsSync extends Service implements SyncControl {
     private awaitHarnessImport;
     /** The profile this process runs, as far as it can be told. */
     private profile;
+    /**
+     * Run a settings write outside any HMR transaction this call chain inherited.
+     *
+     * The settings service fences every write with `hmr.runExclusive`, which
+     * detects nesting with an AsyncLocalStorage flag. That flag follows every
+     * timer and promise created while it is set, so a sync started while the
+     * Plugins page enabled this plugin, or scheduled from a page save, carries it
+     * for good, and every write fails with "HMR transactions cannot be nested".
+     * Leaving the flag's scope queues the write behind the transaction instead.
+     * @param write - the settings service call.
+     * @returns what the call returns.
+     */
+    private outsideHmr;
     /** Read a service this plugin does not declare types for. */
     private lookup;
     /** State path of one file belonging to this profile's sync. */

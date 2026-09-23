@@ -65,6 +65,9 @@ const MAX_WRITE_ATTEMPTS = 5
 /** How long a burst of local edits settles before it is uploaded. */
 const LOCAL_SETTLE_MS = 1000
 
+/** How long a dispose waits for a sync in flight before letting it finish on its own. */
+const DISPOSE_WAIT_MS = 5000
+
 /** Config fields whose change moves or re-authenticates the store. */
 const CONNECTION_FIELDS = new Set([
   'bucket', 'endpoint', 'region', 'prefix', 'forcePathStyle', 'accessKeyIdEnv', 'secretAccessKeyEnv',
@@ -94,6 +97,15 @@ interface ProfileFacts {
 /** Structural view of the Loader, which this plugin does not depend on. */
 interface LoaderFacts {
   await?: () => Promise<unknown>
+}
+
+/**
+ * Structural view of Harness's HMR service, which this plugin does not depend
+ * on: `executing` is the AsyncLocalStorage flag `runExclusive` refuses to nest
+ * under.
+ */
+interface HmrFacts {
+  executing?: { exit?: <R>(callback: () => R) => R }
 }
 
 /** Top-level field names a form schema envelope declares, when it declares an object. */
@@ -238,8 +250,9 @@ export class OssSettingsSync extends Service implements SyncControl {
     yield async () => {
       this.closed = true
       clearTimeout(this.settleTimer)
-      await this.poll.stop()
-      await this.operations
+      // A settings write queued behind the HMR transaction that is disposing
+      // this plugin runs only once the dispose returns, so the wait is bounded.
+      await Promise.race([Promise.all([this.poll.stop(), this.operations]), delay(DISPOSE_WAIT_MS)])
       this.store?.destroy()
     }
   }
@@ -285,6 +298,23 @@ export class OssSettingsSync extends Service implements SyncControl {
     return (this.lookup('profileContext') as ProfileFacts | undefined) ?? {}
   }
 
+  /**
+   * Run a settings write outside any HMR transaction this call chain inherited.
+   *
+   * The settings service fences every write with `hmr.runExclusive`, which
+   * detects nesting with an AsyncLocalStorage flag. That flag follows every
+   * timer and promise created while it is set, so a sync started while the
+   * Plugins page enabled this plugin, or scheduled from a page save, carries it
+   * for good, and every write fails with "HMR transactions cannot be nested".
+   * Leaving the flag's scope queues the write behind the transaction instead.
+   * @param write - the settings service call.
+   * @returns what the call returns.
+   */
+  private outsideHmr<T>(write: () => Promise<T>): Promise<T> {
+    const executing = (this.lookup('hmr') as HmrFacts | undefined)?.executing
+    return typeof executing?.exit === 'function' ? executing.exit(write) : write()
+  }
+
   /** Read a service this plugin does not declare types for. */
   private lookup(name: string): unknown {
     return (this.owner as unknown as { get: (name: string) => unknown }).get(name)
@@ -318,7 +348,7 @@ export class OssSettingsSync extends Service implements SyncControl {
           .map(field => [field, legacyConnection[field]]))
         if (typeof fields['bucket'] === 'string' && fields['bucket'].length > 0) {
           try {
-            await settings.update(SYNC_ENTRY, fields)
+            await this.outsideHmr(() => settings.update(SYNC_ENTRY, fields))
             this.owner.logger.info('dsh-oss-sync: carried the 0.1.x connection into this profile')
           } catch (error) {
             this.owner.logger.warn('dsh-oss-sync: could not carry the 0.1.x connection into this profile')
@@ -334,7 +364,7 @@ export class OssSettingsSync extends Service implements SyncControl {
         const patch = Object.fromEntries(Object.entries(section).filter(([field]) => fields?.has(field) ?? true))
         if (Object.keys(patch).length === 0) continue
         try {
-          await settings.update(entry, patch)
+          await this.outsideHmr(() => settings.update(entry, patch))
         } catch (error) {
           this.owner.logger.warn('dsh-oss-sync: section %s of the 0.1.x cache was not imported', entry)
           this.owner.logger.warn(error)
@@ -548,7 +578,7 @@ export class OssSettingsSync extends Service implements SyncControl {
     for (const path of expressionPaths(full.user)) {
       if (path.length > 0) setPath(next, path, structuredClone(getPath(full.user, path)))
     }
-    await settings.replace(entry, next, redacted.revision)
+    await this.outsideHmr(() => settings.replace(entry, next, redacted.revision))
   }
 
   /** Read this profile's baseline once per location. */
