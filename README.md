@@ -162,7 +162,7 @@ that reason.
 
 `dsh` refuses `--profile desktop` — the Electron application owns that
 directory and installs plugins through its own Plugins page. Install
-`dsh-oss-sync` there (**Plugins → Add plugin**, spec `dsh-oss-sync@0.2.0`), then
+`dsh-oss-sync` there (**Plugins → Add plugin**, spec `dsh-oss-sync@0.2.1`), then
 restart the application.
 
 - `@deepseek-ai/*` are `peerDependencies`: the application supplies them, so
@@ -296,10 +296,10 @@ Upgrade the plugin together with Harness (or right after it): 0.1.x cannot
 start on Harness 0.1.7, and 0.2.0 cannot start before it.
 
 ```sh
-dsh plugin --profile web add dsh-oss-sync@0.2.0
+dsh plugin --profile web add dsh-oss-sync@0.2.1
 ```
 
-On Desktop, install `dsh-oss-sync@0.2.0` from the Plugins page, then restart.
+On Desktop, install `dsh-oss-sync@0.2.1` from the Plugins page, then restart.
 What happens on the first start, once per profile:
 
 - **Harness imports `$DSH_HOME/settings.yaml`** into the profile and renames it
@@ -434,6 +434,12 @@ See [CONTRIBUTING.md](https://github.com/jackchun53/dsh-oss-sync/blob/main/CONTR
 for publishing and the rest of the maintainer-facing detail.
 
 ## Changelog
+
+### 0.2.1
+
+- Fixes every settings entry failing with "HMR transactions cannot be nested"
+  after the plugin is enabled from the Plugins page: settings writes no longer
+  inherit the transaction that started the plugin.
 
 ### 0.2.0
 

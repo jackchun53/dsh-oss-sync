@@ -138,7 +138,7 @@ harness 本身没有发布的 profile（比如 `--profile mine`）只会用
 
 `dsh` 会直接拒绝 `--profile desktop` —— 那个目录归 Electron 应用所有，插件由它
 自己的插件管理页安装。在那里安装 `dsh-oss-sync`（**Plugins → 添加插件**，spec
-`dsh-oss-sync@0.2.0`），然后重启应用。
+`dsh-oss-sync@0.2.1`），然后重启应用。
 
 - `@deepseek-ai/*` 是 `peerDependencies`：由应用提供，插件用的就是宿主自己的那份。
   这些 range 标明了 Harness 0.1.7 这一下限。
@@ -256,10 +256,10 @@ doc:
 在它之前也起不来。
 
 ```sh
-dsh plugin --profile web add dsh-oss-sync@0.2.0
+dsh plugin --profile web add dsh-oss-sync@0.2.1
 ```
 
-Desktop 上，从插件管理页安装 `dsh-oss-sync@0.2.0`，然后重启。首次启动时，每个
+Desktop 上，从插件管理页安装 `dsh-oss-sync@0.2.1`，然后重启。首次启动时，每个
 profile 各发生一次：
 
 - **Harness 把 `$DSH_HOME/settings.yaml` 导入 profile**，并把它改名为
@@ -370,6 +370,11 @@ pnpm test           # 两者都跑
 [CONTRIBUTING.md](https://github.com/jackchun53/dsh-oss-sync/blob/main/CONTRIBUTING.md)。
 
 ## 更新记录
+
+### 0.2.1
+
+- 修复从插件管理页启用插件后，所有设置条目都报 "HMR transactions cannot be
+  nested" 的问题：设置写入不再继承启动插件时所处的事务。
 
 ### 0.2.0
 
