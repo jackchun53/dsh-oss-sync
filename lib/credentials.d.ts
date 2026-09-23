@@ -29,8 +29,13 @@ import { type Config } from './config.js';
  */
 export declare class OssCredentialProvider extends CredentialProvider {
     static Config: z<Config>;
-    /** Parameters the entry config supplies; the namespace overrides them. */
+    /**
+     * Parameters the entry config supplies: the cold-start bootstrap until the
+     * settings sync reports the connection the Plugins page configured.
+     */
     private readonly bootstrap;
+    /** The machine-wide bucket pair a 0.1.x install saved, read as a fallback layer. */
+    private connection;
     private readonly state;
     /** Parameters in force now. */
     private spec;
@@ -122,8 +127,8 @@ export declare class OssCredentialProvider extends CredentialProvider {
     /**
      * Put this machine's saved bucket credentials in force, before the first read.
      *
-     * The settings half owns the file; this half reads the same one so a cold
-     * start reaches the bucket without waiting for the sync namespace. A
+     * A 0.1.x install saved this machine-wide pair; it stays a fallback layer
+     * under the pair the page saves, so a cold start still reaches the bucket. A
      * hand-edited half pair is ignored rather than fatal.
      */
     private adoptStoredConnection;
@@ -147,10 +152,10 @@ export declare class OssCredentialProvider extends CredentialProvider {
      * moved first wins and this machine reports the pull instead of erasing it.
      */
     private push;
-    /** The `oss-sync` namespace value, when the settings half serves it. */
-    private settings;
+    /** The connection the settings sync reports, else this entry's bootstrap. */
+    private desiredSpec;
     /**
-     * Adopt the parameters the namespace resolves to. A poll interval applies
+     * Adopt the parameters the settings sync reports. A poll interval applies
      * immediately; a changed connection or prefix moves this provider to the
      * new location, carrying the document it holds when the target is empty.
      */
@@ -159,7 +164,7 @@ export declare class OssCredentialProvider extends CredentialProvider {
     private relocate;
     /** Swap in a relocation target that has proven reachable, releasing the store it replaces. */
     private adoptRelocation;
-    /** Merge this provider's status into the published sync namespace. */
+    /** Merge this provider's status into the status the settings sync publishes. */
     private report;
     /**
      * Apply one edit to the stored document and commit it under the ETag of the

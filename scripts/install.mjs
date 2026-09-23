@@ -174,8 +174,8 @@ function run(launcher, args, options) {
  */
 function verify(launcher, profile, options) {
   const dump = run(launcher, ['--profile', profile, '--dump-config'], { ...options, capture: true })
-  // The settings row is named by the bare package specifier (the browser module
-  // scan needs that); only the credentials row carries a subpath.
+  // The settings sync row is named by the bare package specifier (the browser
+  // module scan needs that); only the credentials row carries a subpath.
   return dump.includes(`name: ${PACKAGE_NAME}
 `) && dump.includes(`${PACKAGE_NAME}/credentials`)
 }
@@ -185,8 +185,8 @@ function reportEnvironment() {
   const bucket = (process.env[BUCKET_ENV] ?? '').length > 0
   const set = OPTIONAL_ENV.filter(name => (process.env[name] ?? '').length > 0)
   console.log('\nEnvironment (read at launch, by every machine):')
-  console.log(`  ${BUCKET_ENV}=<bucket>${bucket ? '' : '   (not set: the providers start local-only; set it here or in Settings → Plugins)'}`)
-  console.log(`  DSH_SYNC_ENDPOINT / DSH_SYNC_REGION / DSH_SYNC_PREFIX / DSH_SYNC_POLL_MS, or the settings card${set.length === 0 ? '' : `   (already set: ${set.join(', ')})`}`)
+  console.log(`  ${BUCKET_ENV}=<bucket>${bucket ? '' : '   (not set: both halves start local-only; set it here or on Plugins → dsh-oss-sync)'}`)
+  console.log(`  DSH_SYNC_ENDPOINT / DSH_SYNC_REGION / DSH_SYNC_PREFIX / DSH_SYNC_POLL_MS, or the Plugins-page section${set.length === 0 ? '' : `   (already set: ${set.join(', ')})`}`)
   console.log('  DSH_SYNC_ACCESS_KEY_ID / DSH_SYNC_SECRET_ACCESS_KEY, or the AWS SDK chain')
 }
 
@@ -199,13 +199,10 @@ function reportDesktop(spec) {
   console.log(`\n    ${spec}\n`)
   console.log('  lib/ is committed, so the package arrives built: no build script, and')
   console.log('  therefore no allowBuilds approval step.')
-  console.log(`  Desktop and CLI share $DSH_HOME, so the synced settings and credentials`)
-  console.log('  are the same documents on both.')
-  console.log('\n  A Desktop build whose plugin validator predates includePrerelease rejects')
-  console.log('  this spec outright (`requires @deepseek-ai/dsh-credentials@*, found')
-  console.log('  0.1.5-rc.2`). Quit the application, then patch the installed copy:')
-  console.log('\n    node scripts/patch-desktop-asar.mjs --app "<install directory>"\n')
-  console.log('  See "Older Desktop builds" in the README for the paths and the caveats.')
+  console.log('  Desktop and CLI profiles each keep their own settings (Harness 0.1.7 stores')
+  console.log('  them in the profile); both sync with the same bucket document, and share')
+  console.log('  the credential cache under $DSH_HOME.')
+  console.log('\n  This version needs Harness 0.1.7 or later; use dsh-oss-sync@0.1 before that.')
 }
 
 function main() {
@@ -231,7 +228,7 @@ function main() {
       // proves the patch applied, not that the package was merely installed.
       const present = verify(launcher, profile, options)
       console.log(present
-        ? '  ok: the settings and credentials rows are replaced by this plugin'
+        ? '  ok: the settings sync is mounted and the credentials row is replaced by this plugin'
         : '  ! the plugin layer is not composed into this profile')
       if (!present && options.dryRun !== true) failed = true
     } catch (error) {

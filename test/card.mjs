@@ -10,9 +10,11 @@
  *
  * What it covers: the page view renders the fields and the controls directly,
  * the summary view is the one-liner, a staged edit marks the section and a
- * Host-confirmed save clears it, an unconfigured or read-only deployment says
- * so in place, and the masked field can be revealed and copied through the
- * host clipboard.
+ * Host-confirmed save clears it, a refused save says so, list fields save as
+ * arrays, an unconfigured or read-only deployment says so in place, the saved
+ * secret is never expected back and an empty secret input keeps it, clearing
+ * the pair writes both fields empty, and the masked field can be revealed and
+ * copied through the host clipboard.
  *
  * Run with `node test/card.mjs` after `pnpm build`.
  */
@@ -39,7 +41,7 @@ const BASELINE = [
 ]
 
 /** Field count the card renders, from `FIELDS` in the client half. */
-const FIELDS = 8
+const FIELDS = 10
 
 /** Marks an object the stubbed JSX factory produced. */
 const ELEMENT = Symbol('element')
@@ -171,27 +173,58 @@ async function materialize(table) {
   return factory(require)
 }
 
-/** A settings scope stand-in with the members the card's controller uses. */
-function fakeScope(value, options = {}) {
-  let snapshot = { status: 'ready', writable: options.writable ?? true, value, user: {} }
+/**
+ * A `ctx.configForms` stand-in with the members the card's controller uses:
+ * the entry's form, and the describe mirror that carries the secret slots.
+ * Like the Host, it never sends the secret back.
+ */
+function fakeForms(value, options = {}) {
+  let secretSet = options.secretSaved ?? false
+  let snapshot = {
+    status: 'ready', writable: options.writable ?? true, value, user: {}, base: {}, revision: 0, mode: 'host',
+  }
   const listeners = new Set()
+  /** Every mutation the card sent, in order. */
+  const sent = []
+  const directory = () => ({
+    status: 'ready',
+    error: null,
+    view: {
+      writable: true,
+      hasDocument: true,
+      namespaces: [{ ns: 'oss-settings', secrets: [{ path: ['secretAccessKey'], set: secretSet }] }],
+    },
+  })
   const settle = (operations) => {
+    sent.push(operations)
+    if (options.refuse === true) return false
     const next = { ...snapshot.value }
     for (const operation of operations) {
+      if (operation.path[0] === 'secretAccessKey') {
+        secretSet = operation.op === 'set' && operation.value !== ''
+        continue
+      }
       if (operation.op === 'set') next[operation.path[0]] = operation.value
       else delete next[operation.path[0]]
     }
-    snapshot = { ...snapshot, value: next, user: next }
+    snapshot = { ...snapshot, value: next, user: next, revision: snapshot.revision + 1 }
     for (const listener of [...listeners]) listener()
+    return true
+  }
+  const subscribe = (listener) => {
+    listeners.add(listener)
+    return () => { listeners.delete(listener) }
   }
   return {
-    getSnapshot: () => snapshot,
-    subscribe: (listener) => {
-      listeners.add(listener)
-      return () => { listeners.delete(listener) }
+    sent,
+    form: {
+      getSnapshot: () => snapshot,
+      subscribe,
+      mutate: async operations => settle(operations),
+      set: async (key, next) => settle([{ op: 'set', path: [key], value: next }]),
+      unset: async key => settle([{ op: 'unset', path: [key] }]),
     },
-    mutate: async (operations) => { settle(operations) },
-    set: async (key, next) => { settle([{ op: 'set', path: [key], value: next }]) },
+    directory: { getSnapshot: directory, subscribe, ensure: async () => {}, acceptView: () => {} },
   }
 }
 
@@ -203,9 +236,9 @@ function fakeScope(value, options = {}) {
  * @param scopeOverrides - extra scope fields, such as `writable: false`.
  * @returns the rendered tree and the face, for driving interaction.
  */
-async function mountCard(value = {}, scopeOverrides = {}) {
+async function mountCard(value = {}, formOptions = {}) {
   const react = fakeReact()
-  const scope = fakeScope(value, scopeOverrides)
+  const forms = fakeForms(value, formOptions)
   /** Text the section handed to the host clipboard, in order. */
   const clipboard = []
   const module = await materialize({
@@ -218,7 +251,13 @@ async function mountCard(value = {}, scopeOverrides = {}) {
   })
   let registration
   const ctx = {
-    settingsScope: { bind: () => scope },
+    configForms: {
+      get: (entry) => {
+        assert.equal(entry, 'oss-settings', 'the section should edit the sync entry')
+        return forms.form
+      },
+      describe: () => forms.directory,
+    },
     effect: (effect) => { effect() },
     slots: {
       register: (spec, component) => ({ spec, component }),
@@ -233,7 +272,7 @@ async function mountCard(value = {}, scopeOverrides = {}) {
   const props = { ...face, useOssSyncCard: selector => selector(face.hooks.ossSyncCard.getSnapshot()) }
   return {
     face,
-    scope,
+    forms,
     clipboard,
     render: (view = 'page') => react.render(registration.component, { ...props, view }),
   }
@@ -273,8 +312,25 @@ card.face.save()
 await settle()
 tree = card.render()
 assert.doesNotMatch(textOf(tree), /未保存/u, 'a confirmed save should clear the marker')
-assert.equal(card.scope.getSnapshot().value['bucket'], 'my-dsh', 'the save should reach the namespace')
+assert.equal(card.forms.form.getSnapshot().value['bucket'], 'my-dsh', 'the save should reach the entry')
 console.log('ok  section: a Host-confirmed save clears the marker')
+
+card.face.edit('exclude', 'pwsh-sandbox, ui-theme ,')
+card.face.save()
+await settle()
+assert.deepEqual(card.forms.form.getSnapshot().value['exclude'], ['pwsh-sandbox', 'ui-theme'],
+  'a list field should save as an array of entry ids')
+assert.equal(findAll(card.render(), 'input').find(input => input.props.id === 'oss-sync-exclude').props.value,
+  'pwsh-sandbox, ui-theme', 'a list field should render as comma-separated text')
+console.log('ok  section: list fields save as arrays')
+
+const refused = await mountCard({}, { refuse: true })
+refused.face.edit('bucket', 'x')
+refused.face.save()
+await settle()
+assert.match(textOf(refused.render()), /宿主拒绝/u, 'a refused save should say so')
+assert.match(textOf(refused.render()), /未保存/u, 'a refused save keeps the staged edit')
+console.log('ok  section: a save the Host refuses is legible in place')
 
 const localOnly = await mountCard({ status: { settings: { configured: false } } })
 assert.match(textOf(localOnly.render()), /仅本机/u, 'an unconfigured deployment should say so in place')
@@ -285,7 +341,29 @@ console.log('ok  section: an unconfigured or read-only deployment is legible in 
 // Chromium refuses to copy out of `input[type=password]`, so the masked field
 // carries both halves of the affordance: reveal it, or copy it without
 // unmasking it. Either way the value reaches the reader.
-const masked = await mountCard({ secretAccessKey: 'sk-live-secret' })
+// The Host never sends a saved secret: the field says one is saved, and an
+// empty input keeps it.
+const saved = await mountCard({ accessKeyId: 'AKIA-SAVED' }, { secretSaved: true })
+const savedInput = findAll(saved.render(), 'input').find(input => input.props.id === 'oss-sync-secretAccessKey')
+assert.equal(savedInput.props.value, '', 'a saved secret never reaches the page')
+assert.match(savedInput.props.placeholder, /已保存/u, 'the field says a secret is saved')
+saved.face.edit('bucket', 'b2')
+saved.face.save()
+await settle()
+assert.deepEqual(saved.forms.sent.at(-1), [{ op: 'set', path: ['bucket'], value: 'b2' }],
+  'saving with the secret untouched neither sends nor clears it')
+saved.face.clearPair()
+await settle()
+assert.deepEqual(saved.forms.sent.at(-1), [
+  { op: 'set', path: ['accessKeyId'], value: '' },
+  { op: 'set', path: ['secretAccessKey'], value: '' },
+], 'clearing writes the explicitly empty pair the host reads as a request to forget it')
+assert.equal(findAll(saved.render(), 'input').find(input => input.props.id === 'oss-sync-secretAccessKey').props.placeholder,
+  undefined, 'after clearing, no secret is saved')
+console.log('ok  card: the saved secret stays on the Host, and clearing the pair is explicit')
+
+const masked = await mountCard({ accessKeyId: 'AKIA-TYPED' })
+masked.face.edit('secretAccessKey', 'sk-live-secret')
 let maskedTree = masked.render()
 const secretInput = (tree) => findAll(tree, 'input').find(input => input.props.id === 'oss-sync-secretAccessKey')
 const labelled = (tree, label) => findAll(tree, 'button').find(button => button.props['aria-label'] === label)
@@ -300,7 +378,7 @@ console.log('ok  card: the masked field can be revealed in place')
 labelled(maskedTree, '复制：对象存储 AccessKey Secret').props.onClick()
 await settle()
 maskedTree = masked.render()
-assert.deepEqual(masked.clipboard, ['sk-live-secret'], 'copy should hand the stored secret to the host clipboard')
+assert.deepEqual(masked.clipboard, ['sk-live-secret'], 'copy should hand the typed secret to the host clipboard')
 assert.match(textOf(maskedTree), /已复制/u, 'copy should confirm itself'
 )
 assert.equal(secretInput(maskedTree).props.type, 'text', 'copy should not re-mask the field mid-read')

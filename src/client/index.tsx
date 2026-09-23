@@ -4,10 +4,15 @@
  * The Plugins page dispatches one configuration section per bundle that
  * registers into `plugins.bundle.config`, keyed by the bundle's package name,
  * so this file registers a section under `dsh-oss-sync` and edits the
- * `oss-sync` namespace through the client settings scope. Configuration,
- * runtime status, and the action buttons all ride that one scope: the host
- * publishes status into the same namespace, and a button writes the namespace's
- * request token.
+ * `oss-settings` entry's live Config through `ctx.configForms` — Harness
+ * 0.1.7's form over the profile's `cordis.patch.yml`. Configuration, runtime
+ * status, and the action buttons all ride that one form: the host publishes
+ * status into the entry's own `status` reference, and a button writes the
+ * entry's `request` field.
+ *
+ * The bucket's secret access key is a `role('secret')` field, so the Host
+ * never sends it back: the field shows whether one is saved and accepts a new
+ * one, and an empty input keeps the saved value.
  *
  * Single-file on purpose. The host serves one built bundle per package, so a
  * relative import here would be a second module the browser never fetches.
@@ -28,16 +33,14 @@ import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: brings the `ctx.slots` context merge.
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
-// Type-only: brings the `ctx.settingsScope` context merge.
-import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
-// Type-only: this package is not in the browser's baseline module table, and
-// the context merge plus the SettingsScope contract are all this half needs.
-import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
+// Type-only: this package is not in the browser's baseline module table; the
+// `ctx.configForms` context merge and the form contract are all this half needs.
+import type { ConfigForm, ConfigFormSnapshot, SettingsDescribeFace } from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: the `plugins.bundle.config` slot declaration and its owner props.
 import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 
-/** The settings namespace this card edits; the host half registers it. */
-const NS = 'oss-sync'
+/** The profile entry this card edits: the settings sync row the bundle inserts. */
+const ENTRY = 'oss-settings'
 
 /** One editable field of the card. */
 interface FieldSpec {
@@ -53,6 +56,8 @@ interface FieldSpec {
   clearWithEmpty?: boolean
   /** Render a true/false selector and persist a boolean rather than text. */
   boolean?: boolean
+  /** Edit a list of entry ids as comma-separated text and persist an array. */
+  list?: boolean
 }
 
 /** Fields the card edits, in render order. */
@@ -77,9 +82,21 @@ const FIELDS: readonly FieldSpec[] = [
   {
     field: 'secretAccessKey',
     label: '对象存储 AccessKey Secret',
-    hint: '这是 OSS/TOS 的访问密钥，不是模型提供方 API Key；清空两项即删除本机保存。',
+    hint: '这是 OSS/TOS 的访问密钥，不是模型提供方 API Key；宿主不会回传已保存的值，留空即保持不变。',
     secret: true,
     clearWithEmpty: true,
+  },
+  {
+    field: 'include',
+    label: '仅同步这些条目',
+    hint: '逗号分隔的配置条目 ID，例如 llm-pi-ai, agent-default-model；留空同步全部条目。',
+    list: true,
+  },
+  {
+    field: 'exclude',
+    label: '不同步这些条目',
+    hint: '逗号分隔；默认排除保存本机路径的 shell 执行器条目。本插件自身的条目始终不同步。',
+    list: true,
   },
 ]
 
@@ -94,6 +111,8 @@ interface StatusView {
   lastWriteAt?: string
   objectKey?: string
   lastError?: string
+  applied?: string[]
+  uploaded?: string[]
 }
 
 /** What the card renders. */
@@ -118,6 +137,8 @@ interface CardState {
   overridden: Record<string, unknown>
   /** Runtime status by provider. */
   status: Record<string, StatusView>
+  /** Whether the Host holds a saved secret access key it will not send. */
+  secretSaved: boolean
 }
 
 /** One bare observable; the renderer binds it to `useOssSyncCard`. */
@@ -159,12 +180,20 @@ interface OssSyncFace {
   save: () => void
   discard: () => void
   action: (verb: 'pull' | 'push') => void
+  /** Forget the bucket's credential pair, including a machine-wide one from 0.1.x. */
+  clearPair: () => void
 }
 
 /** Props the renderer binds for this card. */
 type OssSyncCardProps = PropsRuntime<'plugins.bundle.config'> & InjectFace<OssSyncFace>
 
-/** Bridges the `oss-sync` scope onto the card's staged form. */
+/** One path-addressed edit the form accepts. */
+type PathOp = Parameters<ConfigForm<Record<string, unknown>>['mutate']>[0][number]
+
+/** Refusal text for a save the Host did not accept; the Host log holds the reason. */
+const REFUSED = '宿主拒绝了这次保存：值未通过校验，或被更高层（主目录补丁、命令行覆盖）遮盖。'
+
+/** Bridges the `oss-settings` form onto the card's staged fields. */
 class CardController {
   private readonly snapshot = observable<CardState>({
     ready: false,
@@ -177,14 +206,26 @@ class CardController {
     values: {},
     overridden: {},
     status: {},
+    secretSaved: false,
   })
 
   private readonly unsubscribe: () => void
 
-  /** @param scope - the bound settings scope for the `oss-sync` namespace. */
-  constructor(private readonly scope: SettingsScope<Record<string, unknown>>) {
-    this.project(scope.getSnapshot())
-    this.unsubscribe = scope.subscribe(() => { this.project(scope.getSnapshot()) })
+  /**
+   * @param form - the shared form for the `oss-settings` entry.
+   * @param directory - the describe mirror, which alone carries the secret-slot facts.
+   */
+  constructor(
+    private readonly form: ConfigForm<Record<string, unknown>>,
+    private readonly directory: SettingsDescribeFace,
+  ) {
+    this.project()
+    const offForm = form.subscribe(() => { this.project() })
+    const offDirectory = directory.subscribe(() => { this.project() })
+    this.unsubscribe = () => {
+      offForm()
+      offDirectory()
+    }
   }
 
   /** The face the slot registration injects. */
@@ -208,17 +249,21 @@ class CardController {
         this.snapshot.set({ ...state, drafts: {}, dirty: false, failure: undefined })
       },
       action: (verb) => { void this.action(verb) },
+      clearPair: () => { void this.clearPair() },
     }
   }
 
-  /** Release the scope subscription. */
+  /** Release the form subscriptions. */
   dispose(): void {
     this.unsubscribe()
   }
 
-  /** Project a scope snapshot onto the card state, keeping unsaved drafts. */
-  private project(snapshot: SettingsScopeSnapshot<Record<string, unknown>>): void {
+  /** Project the form and the secret-slot facts onto the card state, keeping unsaved drafts. */
+  private project(): void {
+    const snapshot: ConfigFormSnapshot<Record<string, unknown>> = this.form.getSnapshot()
     const value = (snapshot.value ?? {}) as Record<string, unknown>
+    const view = this.directory.getSnapshot().view?.namespaces.find(entry => entry.ns === ENTRY)
+    const secretSaved = view?.secrets.some(secret => secret.path.join('.') === 'secretAccessKey' && secret.set) ?? false
     const current = this.snapshot.getSnapshot()
     const drafts: Record<string, string> = {}
     for (const entry of FIELDS) {
@@ -238,6 +283,7 @@ class CardController {
       values: value,
       overridden: (snapshot.user ?? {}) as Record<string, unknown>,
       status: (value['status'] ?? {}) as Record<string, StatusView>,
+      secretSaved,
     })
   }
 
@@ -251,7 +297,9 @@ class CardController {
     // here instead of erroring one field later.
     const fieldAfter = (field: string): string =>
       state.drafts[field] ?? renderValue(state.values[field])
-    const halfPair = (fieldAfter('accessKeyId').length === 0) !== (fieldAfter('secretAccessKey').length === 0)
+    // The saved secret is never sent back; an empty draft keeps it.
+    const secretAfter = (state.drafts['secretAccessKey'] ?? '').length > 0 || state.secretSaved
+    const halfPair = (fieldAfter('accessKeyId').length === 0) === secretAfter
     if (halfPair) {
       this.snapshot.set({ ...state, failure: '访问密钥 ID 与 Secret 必须同时填写或同时清空' })
       return
@@ -267,29 +315,59 @@ class CardController {
       // credential pair behind the same revision fence. Saving them field by
       // field briefly built an invalid half-configured connection and made a
       // first-time setup look as if the form had ignored it.
-      await this.scope.mutate(pending.map((entry) => {
+      const ops = pending.flatMap((entry): PathOp[] => {
         const text = state.drafts[entry.field] ?? ''
+        // An empty secret input keeps the saved secret; clearing is its own control.
+        if (entry.secret === true && text.length === 0) return []
         if (text.length === 0 && entry.clearWithEmpty !== true) {
-          return { op: 'unset' as const, path: [entry.field] }
+          return [{ op: 'unset', path: [entry.field] }]
         }
-        const value = entry.field === 'pollMs' ? Number(text) : entry.boolean === true ? text === 'true' : text
-        return { op: 'set' as const, path: [entry.field], value }
-      }))
+        const value = entry.field === 'pollMs'
+          ? Number(text)
+          : entry.boolean === true
+            ? text === 'true'
+            : entry.list === true
+              ? text.split(',').map(item => item.trim()).filter(item => item.length > 0)
+              : text
+        return [{ op: 'set', path: [entry.field], value }]
+      })
+      const accepted = ops.length === 0 ? true : await this.form.mutate(ops)
       const latest = this.snapshot.getSnapshot()
-      this.snapshot.set({ ...latest, drafts: {}, dirty: false, saving: false })
+      this.snapshot.set(accepted
+        ? { ...latest, drafts: {}, dirty: false, saving: false }
+        : { ...latest, saving: false, failure: REFUSED })
     } catch (error) {
       this.snapshot.set({ ...this.snapshot.getSnapshot(), saving: false, failure: String(error) })
     }
   }
 
-  /** Write a request token; the host runs the verb on both providers. */
+  /** Write a request token; the host runs the verb on both halves. */
   private async action(verb: 'pull' | 'push'): Promise<void> {
     const state = this.snapshot.getSnapshot()
     this.snapshot.set({ ...state, failure: undefined })
     try {
-      await this.scope.set('request', `${verb}:${String(Date.now())}`)
+      const accepted = await this.form.set('request', `${verb}:${String(Date.now())}`)
+      if (!accepted) this.snapshot.set({ ...this.snapshot.getSnapshot(), failure: REFUSED })
     } catch (error) {
       this.snapshot.set({ ...this.snapshot.getSnapshot(), failure: String(error) })
+    }
+  }
+
+  /** Save an explicitly empty pair, which the host reads as "forget the credentials". */
+  private async clearPair(): Promise<void> {
+    const state = this.snapshot.getSnapshot()
+    const drafts = { ...state.drafts }
+    Reflect.deleteProperty(drafts, 'accessKeyId')
+    Reflect.deleteProperty(drafts, 'secretAccessKey')
+    this.snapshot.set({ ...state, drafts, dirty: Object.keys(drafts).length > 0, saving: true, failure: undefined })
+    try {
+      const accepted = await this.form.mutate([
+        { op: 'set', path: ['accessKeyId'], value: '' },
+        { op: 'set', path: ['secretAccessKey'], value: '' },
+      ])
+      this.snapshot.set({ ...this.snapshot.getSnapshot(), saving: false, ...accepted ? {} : { failure: REFUSED } })
+    } catch (error) {
+      this.snapshot.set({ ...this.snapshot.getSnapshot(), saving: false, failure: String(error) })
     }
   }
 }
@@ -300,6 +378,7 @@ class CardController {
  * @returns its text form; absent renders empty.
  */
 function renderValue(value: unknown): string {
+  if (Array.isArray(value)) return value.map(item => String(item)).join(', ')
   return value === undefined || value === null ? '' : String(value)
 }
 
@@ -446,13 +525,13 @@ function OssSyncCard(props: OssSyncCardProps) {
       <p style={DESCRIPTION}>设置与密钥存放于 S3 兼容的存储桶，每台机器读取同一份文档。</p>
 
       {state.available ? null : (
-        <p style={READ_ONLY} role="status">宿主未提供此命名空间：这个部署的设置只留在本机。</p>
+        <p style={READ_ONLY} role="status">宿主未提供 oss-settings 配置条目：请确认 Harness 为 0.1.7 或更高版本且本插件已启用。</p>
       )}
       {state.writable || !state.available ? null : <p style={READ_ONLY} role="status">当前为只读：这个部署不接受设置写入。</p>}
 
       {unconfigured ? (
         <p style={{ ...HINT, margin: 0 }}>
-          尚未配置存储桶：在保存一个之前，设置与密钥只留在本机。保存时会以本机文档作为初始内容写入。
+          尚未配置存储桶：在保存一个之前，设置与密钥只留在本机。保存后，存储桶已有的文档优先；空存储桶以本机内容作为初始内容。
         </p>
       ) : null}
 
@@ -469,6 +548,7 @@ function OssSyncCard(props: OssSyncCardProps) {
               // so the caret and the staged draft survive the toggle.
               type={entry.secret === true && !revealed.includes(entry.field) ? 'password' : 'text'}
               autoComplete={entry.secret === true ? 'new-password' : 'off'}
+              placeholder={entry.secret === true && state.secretSaved ? '已保存（留空保持不变）' : undefined}
               disabled={locked}
               value={text}
               onChange={(event) => { props.edit(entry.field, event.target.value) }}
@@ -511,6 +591,15 @@ function OssSyncCard(props: OssSyncCardProps) {
                     onClick={() => { copyField(entry.field, text) }}
                   >
                     {copied?.field === entry.field ? (copied.ok ? '已复制' : '复制失败') : '复制'}
+                  </button>
+                  <button
+                    type="button"
+                    style={INLINE_CONTROL}
+                    aria-label="清除本机保存的对象存储访问密钥"
+                    disabled={locked}
+                    onClick={() => { props.clearPair() }}
+                  >
+                    清除
                   </button>
                 </div>
               ) : control}
@@ -572,20 +661,22 @@ function describeStatus(status: StatusView | undefined): string {
     status.objectKey === undefined ? undefined : `对象 ${status.objectKey}`,
     status.lastReadAt === undefined ? undefined : `读取 ${status.lastReadAt}`,
     status.lastWriteAt === undefined ? undefined : `写入 ${status.lastWriteAt}`,
+    status.applied === undefined ? undefined : `已应用 ${status.applied.join(', ')}`,
+    status.uploaded === undefined ? undefined : `已上传 ${status.uploaded.join(', ')}`,
     status.lastError === undefined ? undefined : `错误 ${status.lastError}`,
   ]
   return parts.filter(part => part !== undefined).join(' · ')
 }
 
 /** Required browser services (cordis fiber inject). */
-export const inject = ['slots', 'settingsScope']
+export const inject = ['slots', 'configForms']
 
 /**
  * Mount the sync card.
  * @param ctx - the browser plugin context.
  */
 export function apply(ctx: ClientContext): void {
-  const controller = new CardController(ctx.settingsScope.bind({ namespace: NS }))
+  const controller = new CardController(ctx.configForms.get<Record<string, unknown>>(ENTRY), ctx.configForms.describe())
   ctx.effect(() => () => { controller.dispose() }, 'dsh-oss-sync: card controller')
   // The Plugins page declares this slot; registering before it exists would
   // throw, and this deployment may load either half first. The key is the

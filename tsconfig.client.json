@@ -16,6 +16,9 @@
       "@deepseek-ai/schemastery": [
         "../deepseek-harness/vendor/schemastery/lib/types/index.d.ts"
       ],
+      "@deepseek-ai/cosmokit": [
+        "../deepseek-harness/vendor/cosmokit/lib/types/index.d.ts"
+      ],
       "@deepseek-ai/dsh-settings": [
         "../deepseek-harness/packages/settings/settings/lib/types/index.d.ts"
       ],

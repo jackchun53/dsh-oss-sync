@@ -1,24 +1,27 @@
-# The dsh-oss-sync bundle layer.
+# The dsh-oss-sync bundle layer (Harness 0.1.7 and later).
 #
-# The base composition mounts two file-backed stores — `dsh-settings-file`
-# (`$DSH_HOME/settings.yaml`) and `dsh-credentials-local`
-# (`$DSH_HOME/.credentials.yaml`). A loader patch can only override a row's
+# Settings are not replaced any more. Harness 0.1.7 keeps every configurable
+# value in the owning plugin's volatile Config and writes form edits into the
+# profile's own `cordis.patch.yml`; `settings` (`@deepseek-ai/dsh-settings`) is
+# the form projection over that, and it has to stay mounted — the Web and
+# Desktop pages cannot start without it. `oss-settings` is inserted beside it:
+# a client of `ctx.settings` that mirrors the profile's form values to the
+# bucket and applies what other machines committed.
+#
+# Credentials are still replaced. A loader patch can only override a row's
 # `config`: its `name` is an assertion the patch must match, never a
-# replacement. So this layer disables both rows and inserts the object-storage
-# providers on their own ids.
+# replacement. So this layer disables the file-backed `credentials` row
+# (`$DSH_HOME/.credentials.yaml`) and inserts the object-storage provider on
+# its own id.
 #
 # Values come from the launching environment so one installed bundle serves
-# every machine; set them in the shell or in the profile's `cordis.patch.yml`.
-# None of them is a precondition for booting: an empty `bucket` starts the
-# providers local-only, and the settings card is where a connection is supplied
-# (every surface, including Desktop, launches without one).
+# every machine. They are bootstrap defaults: the Plugins-page section saves
+# its own values into the profile, over these. None of them is a precondition
+# for booting: an empty `bucket` starts both halves local-only.
 #
 # A `.env` is not a route for these names: the launcher treats every `DSH_*`
 # variable as launch-environment-only and refuses one that a discovered file
 # tries to set.
-
-- id: settings
-  disabled: true
 
 - id: credentials
   disabled: true
@@ -30,8 +33,6 @@
     - id: oss-settings
       name: 'dsh-oss-sync'
       config:
-        # Empty is the local-only start: the seam is served from this machine's
-        # document until the card saves a bucket.
         bucket: !!js process.env.DSH_SYNC_BUCKET ?? ''
         endpoint: !!js process.env.DSH_SYNC_ENDPOINT
         region: !!js process.env.DSH_SYNC_REGION ?? 'us-east-1'

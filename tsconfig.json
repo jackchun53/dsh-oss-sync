@@ -16,6 +16,7 @@
     "paths": {
       "@deepseek-ai/cordis": ["../deepseek-harness/vendor/cordis/lib/types/index.d.ts"],
       "@deepseek-ai/schemastery": ["../deepseek-harness/vendor/schemastery/lib/types/index.d.ts"],
+      "@deepseek-ai/cosmokit": ["../deepseek-harness/vendor/cosmokit/lib/types/index.d.ts"],
       "@deepseek-ai/dsh-settings": ["../deepseek-harness/packages/settings/settings/lib/types/index.d.ts"],
       "@deepseek-ai/dsh-credentials": ["../deepseek-harness/packages/credentials/credentials/lib/types/index.d.ts"]
     }

@@ -22,9 +22,9 @@ import {
 } from '@deepseek-ai/dsh-credentials'
 import z from '@deepseek-ai/schemastery'
 import {
-  ConfigSchema, applyOverrides, mergeConnection, resolveConfig, sameConnection, type Config, type ResolvedConfig,
+  CredentialsConfigSchema, mergeConnection, readConfig, resolveConfig, sameConnection, type Config, type ResolvedConfig,
 } from './config.js'
-import { SYNC_NAMESPACE, type SyncControl, type SyncSettings, type SyncStatus } from './control.js'
+import type { SyncControl, SyncStatus } from './control.js'
 import {
   ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope, type StoredConnection,
 } from './envelope.js'
@@ -44,7 +44,7 @@ const ENV_SOURCE = 'env'
 /** The source-layer id a value from the bucket reports. */
 const STORE_SOURCE = 'oss'
 
-/** This provider's key in the sync namespace's status map. */
+/** This provider's key in the sync status map. */
 const STATUS_LABEL = 'credentials'
 
 /** Both halves of the seam as stored in one object. */
@@ -88,10 +88,15 @@ function asDocument(value: unknown): CredentialDocument {
  * poll loop.
  */
 export class OssCredentialProvider extends CredentialProvider {
-  static Config: z<Config> = ConfigSchema
+  static Config: z<Config> = CredentialsConfigSchema
 
-  /** Parameters the entry config supplies; the namespace overrides them. */
+  /**
+   * Parameters the entry config supplies: the cold-start bootstrap until the
+   * settings sync reports the connection the Plugins page configured.
+   */
   private readonly bootstrap: ResolvedConfig
+  /** The machine-wide bucket pair a 0.1.x install saved, read as a fallback layer. */
+  private connection: StoredConnection | undefined
   private readonly state: SyncState
   /** Parameters in force now. */
   private spec: ResolvedConfig
@@ -113,7 +118,7 @@ export class OssCredentialProvider extends CredentialProvider {
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
-    this.bootstrap = resolveConfig(config)
+    this.bootstrap = resolveConfig(readConfig(config))
     this.spec = this.bootstrap
     this.store = new ObjectStore(this.spec)
     this.state = new SyncState(this.spec.stateDir)
@@ -329,27 +334,31 @@ export class OssCredentialProvider extends CredentialProvider {
   async* [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void> {
     // This machine's own copy of the bucket credentials is a bootstrap layer:
     // the store needs them before the first read, which happens before any
-    // settings namespace resolves.
+    // connection is reported.
     await this.adoptStoredConnection()
     // A bucket this process cannot authenticate against is a status line, not
     // a reason to refuse to boot: the cache still serves this machine, and the
-    // settings card reports the variables that are missing.
+    // Plugins-page section reports the variables that are missing.
     const preflightError = await this.preflight()
     this.local = await this.load()
-    // The settings half owns the sync namespace and provides the handle both
-    // providers refresh through, so one card action refreshes the settings
-    // document and the credential document together.
+    // The settings sync owns the connection and provides the handle both
+    // halves refresh through, so one page action refreshes the settings
+    // document and the credential document together, and one saved
+    // connection moves both.
     this.ctx.inject(['ossSyncControl'], (controlCtx) => {
-      this.control = controlCtx.ossSyncControl
-      return this.control.join(STATUS_LABEL, {
+      const control = controlCtx.ossSyncControl
+      this.control = control
+      const leave = control.join(STATUS_LABEL, {
         refresh: () => this.refresh(),
         push: () => this.push(),
       })
-    })
-    // The namespace overrides the bootstrap parameters, so a page edit reaches
-    // this provider without a restart.
-    this.ctx.inject(['settings'], () => {
+      const unfollow = control.onConnection(() => { void this.reconcileOrReport() })
       void this.reconcileOrReport()
+      return () => {
+        leave()
+        unfollow()
+        if (this.control === control) this.control = undefined
+      }
     })
     await this.reconcileOrReport()
     this.applyPoll()
@@ -367,13 +376,13 @@ export class OssCredentialProvider extends CredentialProvider {
   /**
    * Put this machine's saved bucket credentials in force, before the first read.
    *
-   * The settings half owns the file; this half reads the same one so a cold
-   * start reaches the bucket without waiting for the sync namespace. A
+   * A 0.1.x install saved this machine-wide pair; it stays a fallback layer
+   * under the pair the page saves, so a cold start still reaches the bucket. A
    * hand-edited half pair is ignored rather than fatal.
    */
   private async adoptStoredConnection(): Promise<void> {
-    const connection: StoredConnection | undefined = await this.state.readConnection()
-    const merged = mergeConnection(this.bootstrap, connection)
+    this.connection = await this.state.readConnection()
+    const merged = mergeConnection(this.bootstrap, this.connection)
     if (sameConnection(merged, this.spec)) return
     try {
       const replacement = new ObjectStore(merged)
@@ -460,18 +469,21 @@ export class OssCredentialProvider extends CredentialProvider {
     })
   }
 
-  /** The `oss-sync` namespace value, when the settings half serves it. */
-  private settings(): SyncSettings | undefined {
-    return this.ctx.get('settings')?.get(SYNC_NAMESPACE) as SyncSettings | undefined
+  /** The connection the settings sync reports, else this entry's bootstrap. */
+  private desiredSpec(): ResolvedConfig {
+    const reported = this.control?.connection()
+    if (reported === undefined) return mergeConnection(this.bootstrap, this.connection)
+    // The state directory is this entry's own: the credential cache lives there.
+    return { ...reported, stateDir: this.bootstrap.stateDir }
   }
 
   /**
-   * Adopt the parameters the namespace resolves to. A poll interval applies
+   * Adopt the parameters the settings sync reports. A poll interval applies
    * immediately; a changed connection or prefix moves this provider to the
    * new location, carrying the document it holds when the target is empty.
    */
   private async reconcile(): Promise<void> {
-    const desired = applyOverrides(this.bootstrap, this.settings())
+    const desired = this.desiredSpec()
     if (desired.pollMs !== this.spec.pollMs) this.poll.restart(desired.pollMs)
     if (sameConnection(desired, this.spec) && desired.prefix === this.spec.prefix) {
       this.spec = desired
@@ -542,6 +554,7 @@ export class OssCredentialProvider extends CredentialProvider {
       // A boot that started local-only left the loop paused; a move that just
       // landed is exactly when polling must begin.
       this.applyPoll()
+      this.report({ state: 'idle', lastError: undefined, lastReadAt: new Date().toISOString() })
     })
   }
 
@@ -555,7 +568,7 @@ export class OssCredentialProvider extends CredentialProvider {
     this.key = nextKey
   }
 
-  /** Merge this provider's status into the published sync namespace. */
+  /** Merge this provider's status into the status the settings sync publishes. */
   private report(patch: Partial<SyncStatus>): void {
     this.control?.report(STATUS_LABEL, {
       configured: this.store.configured,

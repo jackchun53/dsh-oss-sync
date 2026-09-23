@@ -1,194 +1,226 @@
 /**
- * User settings stored in an S3-compatible bucket instead of a local file.
+ * Settings sync over the Harness 0.1.7 settings service.
  *
- * One object holds the whole document — the same namespace-to-section mapping
- * `dsh-settings-file` keeps in `settings.yaml` — wrapped in a revision
- * envelope. A write presents the ETag it read, so two machines can never
- * overwrite each other silently; a poll publishes another machine's committed
- * revision into the seam, which re-resolves every registered namespace.
+ * Harness 0.1.7 has no settings document store to replace: every configurable
+ * value is a plugin's volatile Config field, `ctx.settings` projects those
+ * fields into forms, and a write lands in the active profile's
+ * `cordis.patch.yml` through the configuration editor. So this half no longer
+ * sits under the seam. It sits beside it, as a client of the public API:
  *
- * This provider also owns the `oss-sync` namespace, which is how the settings
- * page reads and drives the sync: the editable connection parameters, the
- * runtime status both providers report, and the request token a card writes.
+ * - it reads the profile's form sections with `describe({ redactSecrets })`,
+ *   so secrets never leave the machine, and leaves `!!js` expressions out;
+ * - it keeps one object in the bucket mapping entry id to section, wrapped in
+ *   the revision envelope and written under an ETag precondition;
+ * - it applies a section another machine committed with `replace()` fenced by
+ *   the entry's describe revision, restoring this profile's own secrets and
+ *   expressions into the section first;
+ * - it reconciles per entry against the baseline of its last sync, recorded
+ *   after every apply, so an applied change is never uploaded back.
+ *
+ * It also owns the connection: its own Config is what the Plugins-page
+ * section edits, and it provides `ossSyncControl`, through which the credential
+ * provider follows that connection and reports its status.
  *
  * @module dsh-oss-sync/settings
  */
 import type { Context } from '@deepseek-ai/cordis';
 import { Service } from '@deepseek-ai/cordis';
-import { SettingsProvider, type SettingsNamespace } from '@deepseek-ai/dsh-settings';
-import z from '@deepseek-ai/schemastery';
-import { type Config } from './config.js';
+import { SyncConfigSchema, type ResolvedConfig } from './config.js';
+import { type SyncControl, type SyncParticipant, type SyncStatus } from './control.js';
+declare module '@deepseek-ai/cordis' {
+    interface Events {
+        /** Instance-local notice from the Loader after it committed volatile Config values. */
+        'loader/volatile-update'(paths: readonly (readonly string[])[]): void;
+    }
+}
+/** The Config the Loader hands this plugin: volatile references for every live field. */
+type SyncConfigInput = ReturnType<typeof SyncConfigSchema>;
 /**
- * Settings provider backed by one object in an S3-compatible bucket.
+ * The settings sync and the connection owner.
  *
- * Reads are served from the document this process last read, wrote, or
- * polled, so a model request never waits on storage; the poll interval is the
- * propagation window between machines. Writes are conditional: a machine that
- * read a stale revision re-reads, re-applies its own section over the newer
- * document, and retries, so concurrent edits on different machines merge
- * instead of erasing each other.
+ * It needs `ctx.settings` to sync and runs local-only without it; the
+ * coordination handle is provided either way, so the credential provider can
+ * always follow the connection.
  */
-export declare class OssSettingsProvider extends SettingsProvider {
-    static Config: z<Config>;
-    /** Parameters the entry config supplies; the namespace overrides them. */
-    private readonly bootstrap;
-    /** The bucket credentials this machine saved from the settings page, if any. */
-    private connection;
+export declare class OssSettingsSync extends Service implements SyncControl {
+    private readonly config;
+    static Config: import("@deepseek-ai/schemastery").default<Schemastery.ObjectS<NoInfer<{
+        stateDir: import("@deepseek-ai/schemastery").default<string, string, "plain">;
+        bucket: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
+        endpoint: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
+        region: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
+        prefix: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
+        forcePathStyle: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile-defined">;
+        accessKeyIdEnv: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
+        secretAccessKeyEnv: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
+        pollMs: import("@deepseek-ai/schemastery").default<number, number, "volatile-defined">;
+        accessKeyId: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
+        secretAccessKey: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
+        include: import("@deepseek-ai/schemastery").default<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
+        exclude: import("@deepseek-ai/schemastery").default<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
+        request: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
+        status: import("@deepseek-ai/schemastery").default<any, any, "volatile">;
+    }>>, Schemastery.ObjectT<NoInfer<{
+        stateDir: import("@deepseek-ai/schemastery").default<string, string, "plain">;
+        bucket: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
+        endpoint: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
+        region: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
+        prefix: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
+        forcePathStyle: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile-defined">;
+        accessKeyIdEnv: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
+        secretAccessKeyEnv: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
+        pollMs: import("@deepseek-ai/schemastery").default<number, number, "volatile-defined">;
+        accessKeyId: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
+        secretAccessKey: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
+        include: import("@deepseek-ai/schemastery").default<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
+        exclude: import("@deepseek-ai/schemastery").default<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
+        request: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
+        status: import("@deepseek-ai/schemastery").default<any, any, "volatile">;
+    }>>, "plain">;
+    /** The plugin's own context: the one its listeners and logs belong to. */
+    private readonly owner;
     private readonly state;
+    /** The machine-wide bucket pair a 0.1.x install saved, read as a fallback layer. */
+    private legacyConnection;
     /** Parameters in force now. */
     private spec;
+    /** The store in force; `undefined` while the configured connection cannot be built. */
     private store;
+    /** Why the configured connection cannot be built, when it cannot. */
+    private storeError;
     private key;
     private readonly poll;
-    private scope;
-    /** Last request token this provider acted on. */
+    /** The settings service while it is mounted. */
+    private settings;
+    /** Set once the migration and the first sync may run: the Loader settled every entry. */
+    private started;
+    /** The baseline of the last sync at the current location, once read. */
+    private baseline;
+    private baselineLoaded;
+    /** Last request token acted on; the one present at boot counts as handled. */
     private handled;
-    /** Status each participant last reported. */
     private readonly status;
+    /** Canonical text of the status last announced to the page, timestamps aside. */
+    private announced;
     private readonly participants;
-    /**
-     * The document this process considers current. It is what the seam holds
-     * and what a deferred publish republishes, so a publish can never resurrect
-     * a superseded local view.
-     */
-    private local;
-    /** ETag of the revision {@link local} reflects; `undefined` until one is read. */
-    private etag;
-    /** Revision number {@link etag} belongs to. */
-    private revision;
-    /** Serializes remote reads and writes, so a poll never interleaves a write. */
+    private readonly connectionListeners;
     private operations;
-    /** Set at dispose: refuse new work and let in-flight work settle. */
+    private settleTimer;
     private closed;
-    constructor(ctx: Context, config: Config);
-    /** Storage is always writable through {@link SettingsProvider.persist}. */
-    get writable(): boolean;
-    /**
-     * Read the stored document once at registration. An unreachable service
-     * falls back to the cache this machine last saw, because a laptop that
-     * starts offline must still boot with its own configuration; a stored
-     * object that is not an envelope this plugin understands is refused.
-     */
-    protected load(): Promise<Record<string, unknown>>;
-    /**
-     * This machine's own copy of the document: what a start without a bucket and
-     * an unreachable bucket both fall back to.
-     * @returns the cached document, or `undefined` while this machine has none.
-     */
-    private loadCache;
-    /**
-     * Store one namespace's next user section.
-     *
-     * The write re-reads the object, keeps every section the newer revision
-     * carries, overlays this namespace's section, and commits under the ETag it
-     * read. A refusal means another machine committed in between: the loop
-     * re-reads and re-applies, so the loser of the race retries against the
-     * winner's document rather than overwriting it.
-     */
-    protected persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void>;
-    /**
-     * Commit one edit without storage, for the machine that has no bucket yet.
-     *
-     * The seam is what the page configures the connection through, so it has to
-     * work before a connection exists: the document stays in memory and in the
-     * cache, and the first bucket saved here seeds it to that location.
-     * @param ns - the namespace being written.
-     * @param section - the section as the seam holds it, runtime fields included.
-     * @param stored - the section narrowed to what storage would keep.
-     */
-    private commitLocally;
-    /**
-     * Put this machine's saved bucket credentials in force, before the first read.
-     *
-     * They are deliberately local: reading the document is what needs them, so
-     * they cannot live in it. A hand-edited half pair is ignored rather than
-     * fatal — the entry config still applies and the card can repair it.
-     */
-    private adoptStoredConnection;
-    /** The composition layer the sync namespace resolves over. */
-    private baseLayer;
-    /**
-     * Keep this machine's copy of the bucket credentials in step with the page.
-     *
-     * A half-filled pair is left alone until the save is complete, so the store
-     * is never rebuilt around half a credential.
-     * @param section - the merged user section as the seam holds it.
-     */
-    private syncStoredConnection;
+    /** Settles once the migration and the first sync ran, for callers that must observe them. */
+    private startedSignal;
+    readonly whenStarted: Promise<void>;
+    constructor(ctx: Context, config: SyncConfigInput);
+    join(label: string, participant: SyncParticipant): () => void;
+    report(label: string, patch: Partial<SyncStatus>): void;
+    connection(): ResolvedConfig;
+    onConnection(listener: () => void): () => void;
     [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void>;
-    /** The coordination handle the credentials provider joins. */
-    private createControl;
     /**
-     * React to a committed `oss-sync` section: run a requested sync, then adopt
-     * any connection parameter the user changed.
+     * Begin syncing once the Loader settled every entry: the forms describe only
+     * active entries, and Harness imports `settings.yaml` at the same point.
+     * @param settings - the settings service this start belongs to.
      */
-    private onSettings;
+    private start;
     /**
-     * Report a bucket this process cannot use yet.
-     * @returns the failure's text, or `undefined` when storage preflight passed
-     *   (including the local-only start, which contacts nothing).
+     * Let Harness's own one-time `settings.yaml` import run first, so the
+     * migration below lands over it rather than under it.
+     */
+    private awaitHarnessImport;
+    /** The profile this process runs, as far as it can be told. */
+    private profile;
+    /** Read a service this plugin does not declare types for. */
+    private lookup;
+    /** State path of one file belonging to this profile's sync. */
+    private profileState;
+    /**
+     * Carry what a 0.1.x install held only in its own cache into this profile,
+     * once per profile: the connection the page saved (when this profile has no
+     * bucket yet), and the settings sections of a machine that never had a
+     * bucket, whose cache was their only copy.
+     * @param settings - the settings service.
+     */
+    private migrate;
+    /** The parameters Config and the machine-wide fallback resolve to now. */
+    private desiredSpec;
+    /** Retire the machine-wide pair a 0.1.x install saved; the page cleared the pair. */
+    private forgetLegacyConnection;
+    /**
+     * Build the store for one parameter set. A connection that cannot be built —
+     * half a credential pair — is a status line, not a failure: the page is
+     * where it gets repaired.
+     * @param desired - the parameters to adopt.
+     */
+    private adoptConnection;
+    /** Whether a bucket is set and a store could be built for it. */
+    private get configured();
+    /**
+     * Report a bucket this process cannot authenticate against yet.
+     * @returns the failure's text, or `undefined` when preflight passed (including local-only).
      */
     private preflight;
-    /**
-     * Adopt the settings the page resolved. A connection the page asked for may
-     * be unreachable or lack credentials; that is a status line the card shows,
-     * never a reason to take the host or the page down.
-     * @param next - the namespace value as the seam resolved it.
-     */
-    private reconcileOrReport;
-    /** Poll only while a bucket is configured; a cleared bucket suspends the loop. */
+    /** Poll only while a bucket is configured. */
     private applyPoll;
-    /** Run the verb a card asked for on this provider and every participant. */
+    /**
+     * React to the Loader committing new volatile values: the page saved a
+     * connection, a poll interval, the scope, or a request token.
+     * @param paths - the changed Config paths.
+     */
+    private onVolatileUpdate;
+    /**
+     * Move to the connection the page saved. A new location starts the sync
+     * over there: an existing document wins, and an empty one is seeded.
+     * @param plain - the Config values now in force.
+     */
+    private reconnect;
+    /** Tell every participant the connection moved. */
+    private notifyConnection;
+    /** Run the verb the page asked for on this half and every participant. */
     private runRequested;
+    /** Whether one profile entry takes part in the sync under the current scope. */
+    private syncs;
+    /** Sync after a burst of local edits settles. */
+    private schedule;
     /**
-     * Adopt the parameters the namespace now resolves to. A poll interval
-     * applies immediately; a changed connection or prefix moves the providers
-     * to the new location, carrying the document this process holds when the
-     * target is empty.
+     * This profile's synced sections: the user layer of every described entry,
+     * secrets redacted and expressions left out. An entry with no user layer
+     * contributes an empty section, which is how a reset propagates.
+     * @param settings - the settings service.
+     * @returns the local document.
      */
-    private reconcile;
-    /** Move both documents' home to the parameters the settings page asked for. */
-    private relocate;
-    /** Swap in a relocation target that has proven reachable, releasing the store it replaces. */
-    private adoptRelocation;
+    private snapshot;
     /**
-     * Move every participant to the location this provider just adopted.
+     * Write one section another machine committed into this profile.
      *
-     * The credentials half follows the same namespace, and the seam offers no
-     * cross-namespace observer, so without this poke a connection saved on the
-     * page would reach the settings document now and the credential document
-     * only at the next poll — or never, while the local-only start has the poll
-     * suspended.
+     * `replace` resets the entry's live fields to what the bundles supply and
+     * sets the section over them, so a field the other machine cleared clears
+     * here too. The section never carries this profile's secrets or `!!js`
+     * expressions, so both are restored into it first; fields this Harness does
+     * not declare are dropped rather than refused.
+     * @param settings - the settings service.
+     * @param entry - the profile entry id.
+     * @param section - the section to apply.
      */
-    private follow;
-    /** Adopt one stored revision as this process's document. */
-    private adopt;
+    private apply;
+    /** Read this profile's baseline once per location. */
+    private loadBaseline;
+    /** Record what this profile and the bucket agree on now. */
+    private saveBaseline;
     /**
-     * Adopt a document that came from storage, keeping the fields that only ever
-     * live here.
-     *
-     * Storage never carries this machine's bucket credentials, so a poll that
-     * overwrote the seam with the stored document would erase the pair the page
-     * saved — and the next reconcile would then lose the connection with it.
-     * @param document - the document as stored.
-     * @returns the document the seam holds.
+     * Reconcile this profile with the bucket once.
+     * @param force - `push` re-commits every local section over the bucket's.
      */
-    private withLocalFields;
-    /** Publish the seam's document with the runtime status merged in. */
-    private publishDocument;
-    /** Merge one participant's status and republish the namespace. */
-    private report;
+    sync(force?: 'push'): Promise<void>;
     /**
-     * Re-commit this machine's document, which is what a `push` request asks
-     * for. The write keeps the same precondition as any other, so a remote that
-     * moved first wins and this machine reports the pull instead of erasing it.
+     * Publish the status map into this entry's own volatile `status` reference,
+     * which `describe()` reads, and tell the page when something it shows moved.
+     * The reference is this process's alone: nothing here writes the profile.
      */
-    private push;
-    /** Read storage once and publish a revision this process did not commit. */
-    private refresh;
-    /** Set while the exclusive section runs, so a nested step joins it instead of queueing behind it. */
-    private exclusive;
-    /** Queue one exclusive operation behind every earlier one. */
+    private publishStatus;
+    /**
+     * Queue one exclusive operation behind every earlier one. Nothing queued
+     * here queues again, so a poll can never interleave an apply or an upload.
+     */
     private enqueue;
 }
-export default OssSettingsProvider;
+export default OssSettingsSync;

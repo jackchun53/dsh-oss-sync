@@ -1,27 +1,28 @@
 /**
- * The channel the settings page reads and drives the sync through.
+ * The coordination handle between the two halves, and the runtime status the
+ * Plugins-page section renders.
  *
- * The seam already carries live values to the browser: a registered settings
- * namespace re-resolves on every commit and the client mirror forwards it. So
- * the sync reuses that channel instead of adding a second one — one namespace
- * holds the editable connection settings, the runtime status the providers
- * publish, and the action token a card writes to ask for a sync.
- *
- * Status and request are runtime facts: they live in the seam's in-memory
- * document and are stripped before anything reaches the bucket.
+ * The settings sync owns the connection — its Config is what the page edits —
+ * and provides this handle; the credential provider joins it, follows the
+ * connection it reports, and publishes its status through it. Status is a
+ * runtime fact: it rides the sync entry's own volatile `status` reference to
+ * the page and never reaches the bucket or the profile patch.
  *
  * @module dsh-oss-sync/control
  */
-/** The settings namespace carrying configuration, status, and actions. */
-export declare const SYNC_NAMESPACE = "oss-sync";
+import type { ResolvedConfig } from './config.js';
+/** Profile entry id of the settings sync row; the Plugins-page section edits it. */
+export declare const SYNC_ENTRY = "oss-settings";
+/** Key the 0.1.x settings document used for the connection; retired in 0.2.0. */
+export declare const LEGACY_SYNC_NAMESPACE = "oss-sync";
 /** Whether a provider's runtime fields are present, or the last failure it hit. */
 export interface SyncStatus {
     /** `idle` after a settled operation, `error` after a failed one. */
     state: 'idle' | 'error';
     /**
      * Whether this provider has a bucket to reach. `false` is the local-only
-     * start: every namespace still resolves, nothing is read or written, and the
-     * first bucket the page saves becomes the remote home.
+     * start: nothing is read or written, and the first bucket the page saves
+     * becomes the remote home.
      */
     configured: boolean;
     /** Revision this provider last read or wrote. */
@@ -40,68 +41,14 @@ export interface SyncStatus {
     lastWriteAt?: string;
     /** The last failure, kept until the next success clears it. */
     lastError?: string;
+    /** Profile entries the last settings sync that moved anything applied from the bucket. */
+    applied?: string[];
+    /** Profile entries the last settings sync that moved anything uploaded to the bucket. */
+    uploaded?: string[];
 }
 /** Per-provider status, keyed by the provider's own label. */
 export type SyncStatusMap = Record<string, SyncStatus>;
-/** Runtime fields carried in the namespace but never stored in the bucket. */
-export interface SyncRuntime {
-    /** Status each provider last reported. */
-    status?: SyncStatusMap;
-    /**
-     * A card's sync request, written as `<verb>:<token>`; any change to this
-     * value runs the verb on every provider. `pull` adopts the stored revision;
-     * `push` re-commits this machine's document.
-     */
-    request?: string;
-}
-/** The editable connection settings, as the settings page sees them. */
-export interface SyncSettings extends SyncRuntime {
-    /** Bucket holding the documents; defaults to the entry config. Empty leaves this machine local-only. */
-    bucket?: string;
-    /** S3-compatible endpoint; defaults to the entry config. */
-    endpoint?: string;
-    /** Signature region; defaults to the entry config. */
-    region?: string;
-    /** Key prefix inside the bucket; changing it moves both documents. */
-    prefix?: string;
-    /** Poll interval in milliseconds. */
-    pollMs?: number;
-    /** Opt into path-style addressing for services such as MinIO. */
-    forcePathStyle?: boolean;
-    /** Environment variable holding the access key id. */
-    accessKeyIdEnv?: string;
-    /** Environment variable holding the secret access key. */
-    secretAccessKeyEnv?: string;
-    /**
-     * Access key id for the bucket, typed on the settings page. Kept on this
-     * machine only — a bucket cannot hold the credentials that reading it needs
-     * — and an empty value clears what this machine holds.
-     */
-    accessKeyId?: string;
-    /** Secret access key for the bucket, kept on this machine like {@link SyncSettings.accessKeyId}. */
-    secretAccessKey?: string;
-}
-declare module '@deepseek-ai/cordis' {
-    interface Context {
-        /** Coordination handle the settings half provides for the sync namespace. */
-        ossSyncControl: SyncControl;
-    }
-}
-/**
- * The bucket's own credentials: fields that stay on this machine because
- * storage cannot hold the credentials that reading storage needs.
- */
-export declare const LOCAL_CREDENTIAL_FIELDS: readonly ["accessKeyId", "secretAccessKey"];
-/**
- * Remove the local-only fields from a namespace section.
- * @param section - the section as the seam holds it.
- * @returns a detached copy carrying only what storage should keep.
- */
-export declare function storedSection(section: Record<string, unknown>): Record<string, unknown>;
-/**
- * One provider's seat in the sync: what a card's request runs, and where the
- * provider's status goes.
- */
+/** One provider's seat in the sync: what a page request runs on it. */
 export interface SyncParticipant {
     /** Adopt the stored revision now, bypassing the poll interval. */
     refresh: () => Promise<void>;
@@ -112,37 +59,42 @@ export interface SyncParticipant {
 export type SyncVerb = 'pull' | 'push';
 /**
  * Read the verb out of a request token.
- * @param request - the token a card wrote.
+ * @param request - the token the page wrote.
  * @returns the verb, defaulting to `pull` for a token that names none.
  */
 export declare function requestVerb(request: string): SyncVerb;
 /**
- * Coordination between the two providers and the status they publish.
+ * Coordination between the two halves.
  *
- * The settings provider owns the namespace and provides this service; the
- * credentials provider joins it, so one card action refreshes both without
- * either provider knowing the other exists.
+ * The settings sync provides it; the credential provider joins, so one page
+ * action refreshes both documents and one saved connection moves both.
  */
 export interface SyncControl {
     /**
      * Join the sync under one status label.
-     * @param label - key this participant's status occupies in the namespace.
-     * @param participant - the participant's refresh hook.
+     * @param label - key this participant's status occupies in the status map.
+     * @param participant - the participant's refresh and push hooks.
      * @returns the disposer removing the participant.
      */
     join: (label: string, participant: SyncParticipant) => () => void;
     /**
-     * Merge one participant's status into the published namespace.
+     * Merge one participant's status into the published status map.
      * @param label - the participant's status key.
      * @param patch - fields to merge over its last reported status.
      */
     report: (label: string, patch: Partial<SyncStatus>) => void;
+    /** @returns the connection the page configured, as the settings sync resolved it. */
+    connection: () => ResolvedConfig;
+    /**
+     * Observe connection changes the page saves.
+     * @param listener - invoked after the settings sync adopted a new connection.
+     * @returns the disposer removing the listener.
+     */
+    onConnection: (listener: () => void) => () => void;
 }
-/**
- * Strip the local-only fields from a whole document before it is written to
- * storage — the seed a provider carries to a new location is the seam's
- * document, which holds this process's status.
- * @param document - the document as the seam holds it.
- * @returns a detached copy carrying only what belongs in the bucket.
- */
-export declare function storedDocument(document: Record<string, Record<string, unknown>>): Record<string, Record<string, unknown>>;
+declare module '@deepseek-ai/cordis' {
+    interface Context {
+        /** Coordination handle the settings sync provides. */
+        ossSyncControl: SyncControl;
+    }
+}

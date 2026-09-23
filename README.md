@@ -6,15 +6,31 @@ Keep one machine's DeepSeek Harness settings and API keys in an S3-compatible
 bucket, so every other machine boots with the same configuration instead of
 having its files copied by hand.
 
-It is an installable plugin bundle that replaces the two stores that make a
-machine yours — **user settings** (models, providers, default model) and
-**credentials** (API keys) — and puts both in one bucket as readable YAML you
-can diff and hand-edit.
+It is an installable plugin bundle with two halves:
 
-Everything above the seam is untouched. The Web **Settings → Models** page
+- **Settings sync.** A client of the Harness settings service
+  (`ctx.settings`). It mirrors this profile's settings — models, providers,
+  default model, and every other value the settings pages edit — into one
+  readable YAML document in the bucket, and applies what other machines
+  committed there.
+- **Credentials store.** It replaces the store that holds your API keys
+  (`$DSH_HOME/.credentials.yaml`) with a second document in the same bucket.
+
+Everything above those seams is untouched. The Web **Settings → Models** page
 still writes through `ctx.settings`, the model picker still resolves keys
 through `ctx.credentials`, and `agent-default-model`, `llm-pi-ai`, and
-`llm-deepseek` keep their namespaces. Only the storage moved.
+`llm-deepseek` keep their entries.
+
+## Requirements
+
+**Harness 0.1.7 or later.** 0.2.0 is built on the settings model Harness
+0.1.7 introduced (values live in each plugin's volatile Config and are saved in
+the profile's `cordis.patch.yml`). On an older Harness, keep using
+`dsh-oss-sync@0.1` — and do not run 0.1.x on Harness 0.1.7: it disables the
+settings service, and the Desktop application then fails at startup with
+`desktop welcome: Web RPC failed`. See [Migrating from 0.1.x](#migrating-from-01x).
+
+The bucket must support `If-Match` and `If-None-Match` on `PutObject`.
 
 ## Quick start
 
@@ -23,7 +39,7 @@ through `ctx.credentials`, and `agent-default-model`, `llm-pi-ai`, and
 dsh plugin --profile web add dsh-oss-sync
 
 # 2. point it at a bucket — either in the environment the surface launches from,
-#    or afterwards on the bundle's Plugins page, which is the same document
+#    or afterwards in the bundle's section on the Plugins page
 export DSH_SYNC_BUCKET=my-dsh
 export DSH_SYNC_ENDPOINT=https://oss-cn-shanghai.aliyuncs.com   # omit for AWS
 export DSH_SYNC_REGION=cn-shanghai
@@ -33,15 +49,78 @@ export DSH_SYNC_REGION=cn-shanghai
 
 Every machine that installs the bundle and reads the same bucket then shares
 both documents. Setting up a second machine is those same three steps — the
-configuration is already in the bucket.
+configuration is already in the bucket, and a machine syncing for the first
+time takes it from there.
 
-Without a bucket the surfaces still start: the providers run local-only, every
-namespace resolves from this machine's own cached document, nothing is read or
-written to a service, and the configuration section is where you supply one. On the first boot,
-`settings.yaml` and `.credentials.yaml` are imported into that cache before the
-file-backed rows are retired. Saving a bucket there then seeds it from the
-whole document this machine holds, so existing model-provider API keys and
-anything typed before the bucket existed are not lost.
+Without a bucket the surfaces still start: both halves run local-only, settings
+stay in the profile, credentials stay in this machine's cache, nothing is read
+or written to a service, and the Plugins-page section is where you supply a
+bucket.
+
+## What syncs
+
+The settings document holds one section per **profile entry** that the
+settings service describes — the same entry ids the settings pages edit
+(`agent-default-model`, `llm-pi-ai`, `llm-deepseek`, `web-search-deepseek`,
+`permission`, `ui-theme`, `locale`, …). A section is that entry's **user
+layer**: the values saved in this profile, not the bundle defaults underneath
+them.
+
+Deliberately left out:
+
+- **Secrets.** Every field a plugin declares `role('secret')` (for example a
+  Web Search API key typed into its form) is redacted before anything is read,
+  and restored from this profile when a section is applied. API keys belong in
+  the credentials store, which syncs them on purpose.
+- **`!!js` expressions.** A value such as `apiKeyEnv: !!js process.env.X`
+  reads this machine's environment; it stays in the profile and survives an
+  apply.
+- **Machine-specific entries.** By default the shell executors
+  (`pwsh-sandbox`, `bash-sandbox`, `pwsh-local`, `bash-local`, `shell`) are
+  excluded: they hold this machine's working directory and executable paths.
+  Change the scope with `include` / `exclude` (below).
+- **This plugin's own rows** (`oss-settings`, `oss-credentials`): the
+  connection is what reading the bucket needs, so it never lives in it.
+- **Entries this profile does not run.** A section for a plugin that is not
+  installed here is kept in the bucket for the machines that run it, and is
+  applied the first time this profile runs that plugin.
+
+The credentials document holds `refs` (reference name to secret value) and
+`records` (per-plugin credential records, including authorization grants), as
+in 0.1.x.
+
+## How the settings sync works
+
+- **Upload.** A settings write (from any page, or a hand edit to the profile
+  patch that Harness reloads) raises `settings/document-updated`. After a
+  one-second settle the sync reads the profile's sections and uploads the
+  entries that changed since its last sync, under the ETag it read.
+- **Apply.** Every poll reads the object. An entry the bucket changed and this
+  profile did not is applied with `ctx.settings.replace()`, fenced by the
+  entry's revision; the section is completed with this profile's own secrets
+  and expressions first, and fields this Harness does not declare are dropped.
+  An entry another machine reset is reset here too.
+- **No echo.** Each profile records a baseline — the bucket's sections and its
+  own, as of its last sync — and records it *after* every apply. An applied
+  section therefore reads back as unchanged local state and is never uploaded
+  again; a sync with nothing new writes nothing, in either direction.
+- **Seeding.** An entry the baseline has not seen — every entry on the first
+  sync at a location — takes the bucket's section when the bucket has one
+  (**an existing bucket wins on a fresh machine**) and seeds the bucket from
+  this profile otherwise (**this profile seeds an empty bucket**). Entries only
+  this machine holds are merged in rather than dropped.
+- **Conflicts.** Two machines editing **different** entries merge. Two
+  machines editing the **same** entry: the later upload wins wholesale for
+  that entry. A refused write (`412 Precondition Failed`) re-reads and
+  re-plans.
+- **Propagation.** Settings are applied by the poll, so `pollMs` (default
+  30 s) is the propagation window; an edit leaves the machine about a second
+  after it is saved.
+
+The baseline is per profile, under
+`$DSH_HOME/.dsh-oss-sync/profiles/<profile>/settings-sync.yaml`. Since Harness
+0.1.7 keeps settings per profile, the Desktop and a CLI profile on one machine
+each sync with the bucket on their own — and through it, with each other.
 
 ## Install
 
@@ -72,8 +151,8 @@ node scripts/install.mjs --profile web --desktop
 ```
 
 Either way the script composes the profile with `--dump-config` and checks that
-`dsh-oss-sync/settings` and `dsh-oss-sync/credentials` are the rows in force.
-That check matters: a package can install without its layer being composed.
+`dsh-oss-sync` and `dsh-oss-sync/credentials` are the rows in force. That check
+matters: a package can install without its layer being composed.
 
 A profile the harness does not ship (`--profile mine`) initializes with
 `@deepseek-ai/dsh-base` alone, so it has no Web UI. `web` is the default for
@@ -81,183 +160,102 @@ that reason.
 
 ### Desktop
 
-`dsh` refuses `--profile desktop` outright — the Electron application owns that
-directory and installs plugins through its own plugin window:
+`dsh` refuses `--profile desktop` — the Electron application owns that
+directory and installs plugins through its own Plugins page. Install
+`dsh-oss-sync` there (**Plugins → Add plugin**, spec `dsh-oss-sync@0.2.0`), then
+restart the application.
 
-```
-error: profile "desktop" is managed exclusively by the Electron application
-```
-
-That window accepts **npm registry package specs only**. It validates the spec
-with `packageNameFromSpec`, rejects anything carrying a URL scheme or `file:`,
-and then runs `pnpm add <spec> --save-exact --ignore-scripts` inside the
-profile. A `github:` or local-path spec that works for a CLI profile therefore
-cannot be installed from Desktop at all.
-
-So install `dsh-oss-sync` (pin the version if the window asks for one) from the
-plugin window. Three properties make it fit that validation:
-
-- `@deepseek-ai/*` are `peerDependencies`, which is what Desktop requires of
-  host-owned packages, and their `*` ranges satisfy whatever the application
-  bundles. That last part needs a validator that compares peer ranges with
-  prereleases included: Desktop itself ships prerelease host packages
-  (`0.1.5-rc.2`), and plain semver never matches `*` against a prerelease, so
-  an older Desktop rejects the install with
-  `requires @deepseek-ai/dsh-credentials@*, found 0.1.5-rc.2`. The fix belongs
-  in `apps/desktop/src/profile-packages.ts`
-  (`satisfies(version, range, { includePrerelease: true })`), because no range
-  a plugin could declare survives the next prerelease tuple. Until a build
-  carrying it is in hand, patch the installed one — see *Older Desktop builds*
-  below.
+- `@deepseek-ai/*` are `peerDependencies`: the application supplies them, so
+  the plugin runs against the host's own copies. The ranges state the Harness
+  0.1.7 floor.
 - Its ordinary dependencies (`@aws-sdk/client-s3`,
   `@aws-sdk/credential-provider-node`, `yaml`) resolve inside the profile and
-  ship no install scripts, so the reviewed-build list does not need an entry.
-- `--ignore-scripts` means nothing builds on install, which is why `lib/` and
-  `lib/client.js` are committed and the published tarball carries them.
+  ship no install scripts.
+- `lib/` and `lib/client.js` are committed and the published tarball carries
+  them, so nothing builds on install.
 
-Desktop and CLI share `$DSH_HOME`, so both surfaces read the same two synced
-documents and the same offline cache.
+Desktop needs no environment variable to start. `setx DSH_SYNC_BUCKET ...`
+still works as a bootstrap default. Note that `DSH_*` names cannot come from a
+`.env` file — the harness treats the whole prefix as launch-environment-only.
 
-Desktop needs no environment variable to start: with no bucket the providers
-run local-only, the application boots, and the bundle's Plugins page is where
-the connection is configured. `setx DSH_SYNC_BUCKET ...` still works, but it is a
-bootstrap default, not a precondition. Note that `DSH_*` names cannot come from
-a `.env` file — the harness treats the whole prefix as launch-environment-only.
-
-Restart the surface after installing: the providers are mounted at boot.
-
-### Older Desktop builds
-
-The validator gap above is only fixable in the application, so a Desktop build
-that predates the fix rejects this package whatever the manifest says.
-`scripts/patch-desktop-asar.mjs` writes that one argument into an installed
-build instead, which is what makes the plugin installable there:
-
-```sh
-# 1. quit the application completely, tray included: app.asar is rewritten in place
-# 2. patch the installed build, at the default install directory
-node scripts/patch-desktop-asar.mjs --app "%LOCALAPPDATA%\Programs\DeepSeek Harness"
-
-# patched C:\Users\you\AppData\Local\Programs\DeepSeek Harness\resources\app.asar
-#   backup:   ...\resources\app.asar.bak
-#   files:    /lib/main.js (90953 -> 90982 bytes)
-#   size:     2365617 -> 2365646 bytes
-
-# 3. start it again, then install dsh-oss-sync from the plugin window
-```
-
-PowerShell spells the variable `$env:LOCALAPPDATA`, and a non-default install
-directory is whatever you pointed the installer at. No separate Node install is
-needed either way: the application ships one at
-`resources\runtime\node\node.exe`, beside the archive being patched, and any
-recent Node behaves identically.
-
-The script rides in the published tarball too, at
-`$DSH_HOME/profiles/desktop/node_modules/dsh-oss-sync/scripts/patch-desktop-asar.mjs`,
-which is the copy to reach for when the application is reinstalled later.
-
-| Invocation | Archive it patches |
-|---|---|
-| `node scripts/patch-desktop-asar.mjs` | `./resources/app.asar`: the unpacked build the shell is standing in |
-| `node scripts/patch-desktop-asar.mjs "<app.asar>"` | that archive |
-| `node scripts/patch-desktop-asar.mjs --app "<dir>"` | `<dir>/resources/app.asar` |
-| `node scripts/patch-desktop-asar.mjs --help` | nothing; prints the usage above |
-
-Exactly one file changes: `satisfies(dependency.version, range)` becomes
-`satisfies(dependency.version, range, { includePrerelease: true })` in the
-compiled `lib/main.js`. The asar header's per-file integrity entries are
-recomputed for that one file, so the archive stays structurally what
-`electron-builder` wrote and the application cannot tell the difference.
-
-The patch is idempotent — an already-patched archive prints `already patched;
-nothing to do` and exits — and the `.bak` beside it is written once, on the first
-run, so re-running never overwrites the original. It does have to be re-run
-after every reinstall or upgrade: `app.asar` is regenerated, and the patch is
-not.
-
-This is Windows-only, and only for the unsigned artifacts this project builds.
-Rewriting a signed macOS bundle's `app.asar` invalidates its signature and
-notarization.
+The `scripts/patch-desktop-asar.mjs` workaround shipped with 0.1.x is gone:
+it patched a peer-range validator that Desktop 0.1.7 no longer has.
 
 ## Configure
 
 ### Environment
 
-The providers read their connection from the launching environment on every
-surface, so one installed package serves every machine. Every value here is a
-bootstrap default: an unset one is simply absent, and the configuration section omits
-it from storage until you set it there.
+Both halves read their connection from the launching environment, so one
+installed package serves every machine. Every value here is a bootstrap
+default: the Plugins-page section saves its own values into the profile, over
+these.
 
 | Variable | Meaning |
 |---|---|
-| `DSH_SYNC_BUCKET` | Bucket holding the documents. Unset starts the providers local-only; set it here or in the configuration section. |
-| `DSH_SYNC_ENDPOINT` | S3-compatible endpoint (MinIO, Ceph, COS); omit for AWS. |
+| `DSH_SYNC_BUCKET` | Bucket holding the documents. Unset starts both halves local-only; set it here or in the section. |
+| `DSH_SYNC_ENDPOINT` | S3-compatible endpoint (MinIO, Ceph, COS, OSS, TOS); omit for AWS. |
 | `DSH_SYNC_REGION` | Region for the signature; defaults to `us-east-1`. |
 | `DSH_SYNC_PREFIX` | Key prefix; defaults to `dsh-sync`. |
 | `DSH_SYNC_FORCE_PATH_STYLE` | Set to `true` only for services that require path-style addressing (commonly MinIO). Defaults to virtual-hosted style, which TOS, OSS, and AWS require. |
 | `DSH_SYNC_POLL_MS` | Poll interval in milliseconds; defaults to `30000`. |
-| `DSH_SYNC_ACCESS_KEY_ID` / `DSH_SYNC_SECRET_ACCESS_KEY` | Static credentials for the bucket; unset falls back to the pair saved in the configuration section, then to the SDK's own chain (`AWS_ACCESS_KEY_ID`, a profile, an instance role). |
+| `DSH_SYNC_ACCESS_KEY_ID` / `DSH_SYNC_SECRET_ACCESS_KEY` | Static credentials for the bucket; see the precedence below. |
 
-The pair the section saves wins over the environment, and the environment wins over
-the SDK chain. The section's pair is the only one of the three that never leaves
-the machine.
+Bucket credentials resolve in this order: the pair saved in the section, then
+the machine-wide pair a 0.1.x install saved
+(`$DSH_HOME/.dsh-oss-sync/connection.yaml`), then the two environment
+variables, then the SDK's own chain (`AWS_ACCESS_KEY_ID`, a profile, an
+instance role).
+
+### The configuration section
+
+Open the bundle's page — **Plugins → dsh-oss-sync** — and the section sits
+between the description and the row list, tagged `仅本机` until a bucket is
+saved, `只读` where the deployment is not writable, `等待宿主` before the Host
+has answered, and `未保存` while an edit is staged. Leaving the page drops every
+staged edit; a refused save keeps its drafts and says so in place.
+
+The section edits the `oss-settings` row's live Config through the Harness
+settings forms, so a save lands in this profile's `cordis.patch.yml` and takes
+effect without a restart. Harness stores the row's complete config there; the
+`!!js process.env…` defaults of the fields you did not edit are kept as
+expressions.
+
+| Field | Meaning |
+|---|---|
+| `bucket`, `endpoint`, `region`, `forcePathStyle`, `accessKeyIdEnv`, `secretAccessKeyEnv` | Connection parameters. An endpoint without a URL scheme is normalized to `https://`. TOS/OSS/AWS use `forcePathStyle: false`; enable it only when a MinIO-compatible service requires it. |
+| `accessKeyId`, `secretAccessKey` | The bucket's own OSS/TOS/S3 credentials — **not** a model provider API key. Saved in this profile's `cordis.patch.yml` (mode 0600), never written to the bucket. The secret is a `role('secret')` field: the Host never sends it back, so the input shows `已保存（留空保持不变）` and an empty input keeps it. **清除** saves an explicitly empty pair, which also removes a machine-wide `connection.yaml` left by 0.1.x. |
+| `prefix` | Key prefix. Changing it moves both documents: an existing document at the new location wins, an empty one is seeded from this profile. |
+| `pollMs` | Poll interval; applies immediately. |
+| `include` | Comma-separated entry ids to sync; empty syncs every entry. |
+| `exclude` | Comma-separated entry ids never synced; defaults to the shell executors. |
+| `status` | Runtime, read-only: per half (`settings`, `credentials`), revision, writer, commit time, object key, last read/write, the entries the last sync applied or uploaded, and the last error. This plugin publishes it into its own running Config reference; it is never written to the profile or the bucket. |
+| `request` | **立即同步** / **强制推送** write a new token here; the Host runs the sync on both halves. `push` re-commits this profile's sections over the bucket's. |
+
+`secretAccessKey` renders masked, and Chromium refuses to cut or copy out of a
+masked input. So that field carries **显示 / 隐藏**, which re-types the input
+without touching the value, and **复制**, which hands the field's current text
+to the host clipboard — both act on what you typed, since a saved secret never
+reaches the page.
 
 ### Per-profile overrides
 
-To keep machine-specific values out of the environment, override the two rows
-in the profile's own `$DSH_HOME/profiles/<name>/cordis.patch.yml` instead:
+The section is the usual way to configure a profile, and it writes the
+profile's `$DSH_HOME/profiles/<name>/cordis.patch.yml`. Editing that file by
+hand works too:
 
 ```yaml
 - id: oss-settings
   config:
     bucket: my-dsh
     endpoint: https://oss-cn-shanghai.aliyuncs.com
-- id: oss-credentials
-  config:
-    bucket: my-dsh
-    endpoint: https://oss-cn-shanghai.aliyuncs.com
+    exclude: [pwsh-sandbox, bash-sandbox, ui-theme]
 ```
 
-The bucket must support `If-Match` and `If-None-Match` on `PutObject`.
+`oss-credentials` needs no row of its own: the credentials half follows the
+connection `oss-settings` resolves. Its own row is only the cold-start default.
+
 Governance-mode bucket versioning is strongly recommended: it is what turns a
 mistaken overwrite into a recoverable revision.
-
-### The configuration section
-
-The Plugins page reads and drives the sync through one registered settings
-namespace (`oss-sync`), because the seam already carries live values to the
-browser: a namespace re-resolves on every commit and the client mirror forwards
-it. No second channel was needed.
-
-Open the bundle's page — **Plugins → dsh-oss-sync** — and the configuration
-section sits between the description and the row list, named and tagged the
-way the page's own sections are: `仅本机` until a bucket is saved, `只读`
-where the deployment is not writable, `等待宿主` before the Host has answered,
-and `未保存` while an edit is staged. Leaving the page drops every staged
-edit; a rejected save keeps its diagnostics, and its drafts, in view.
-
-`secretAccessKey` renders masked, and Chromium refuses to cut or copy out of a
-masked input — on every platform, by design. So that one field carries the two
-controls the platform withholds: **显示 / 隐藏** re-types the same input between
-`password` and `text` without touching the value or the staged draft, and
-**复制** hands the field's current text to the host clipboard. Copying a secret
-never unmasks it on screen.
-
-| Field | Meaning |
-|---|---|
-| `bucket`, `endpoint`, `region`, `forcePathStyle`, `accessKeyIdEnv`, `secretAccessKeyEnv` | Connection parameters; the entry config is the base layer, so an unset field keeps what `cordis.yml` and the environment supply. An endpoint without a URL scheme is normalized to `https://`. TOS/OSS/AWS use `forcePathStyle: false`; enable it only when a MinIO-compatible service requires it. |
-| `accessKeyId`, `secretAccessKey` | The bucket's own OSS/TOS/S3 credentials — **not** a model provider API key. Typed here, stored on this machine only (`$DSH_HOME/.dsh-oss-sync/connection.yaml`, mode 0600), never written to the bucket. Clearing both removes the local file. |
-| `prefix` | Key prefix. Changing it moves both documents and seeds the new location from the document this machine holds. |
-| `pollMs` | Poll interval; applies immediately. |
-| `status` | Runtime, read-only. Per provider (`settings`, `credentials`): revision, writer, commit time, device id, object key, last read/write, last error. |
-| `request` | Write any new value to run a sync now, on both providers, without waiting for the interval. |
-
-`status`, `request`, and this machine's credentials are stripped before
-anything reaches the bucket, so the stored document holds configuration only.
-Changing the connection parameters rebuilds the client and re-reads the new
-location at once; the cache under `$DSH_HOME/.dsh-oss-sync/`, and the
-`connection.yaml` beside it, are what make that safe when the new location is
-unreachable or empty.
 
 ## What lands in the bucket
 
@@ -268,7 +266,7 @@ readable YAML so you can diff and hand-edit them:
 v: 1
 rev: 12
 writer: 6f1c1a1e-…
-updatedAt: 2026-09-14T09:12:03.114Z
+updatedAt: 2026-09-23T09:12:03.114Z
 doc:
   llm-deepseek:
     reasoningEffort: max
@@ -283,33 +281,55 @@ doc:
     model: deepseek-flash
 ```
 
-`credentials.yaml` holds `refs` (reference name to secret value) and
-`records` (per-plugin credential records, including authorization grants).
+The envelope and the object keys are the ones 0.1.x wrote, so a bucket 0.1.x
+filled is read as-is. The 0.1.x section keys `ui-developer-tools` and
+`ui-onboarding` are read as the entries that own them now (`ui-settings`,
+`ui-settings-general`), and the 0.1.x `oss-sync` section is ignored.
 
-Per-machine state stays local under `$DSH_HOME/.dsh-oss-sync/`: a stable
-`device-id`, a cache of the last document read, and one-time legacy-import
-markers. The original `settings.yaml` and `.credentials.yaml` are left
-untouched as recovery copies; the markers prevent a key deliberately deleted
-through the sync provider from being resurrected on the next restart.
+Per-machine state stays under `$DSH_HOME/.dsh-oss-sync/`: a stable
+`device-id`, the credential cache, one-time import markers, and each profile's
+settings baseline.
 
-## Concurrency and propagation
+## Migrating from 0.1.x
 
-Every write presents the ETag of the revision it read. A refused write
-(`412 Precondition Failed`) re-reads the newer document, re-applies the local
-change over it, and retries — so:
+Upgrade the plugin together with Harness (or right after it): 0.1.x cannot
+start on Harness 0.1.7, and 0.2.0 cannot start before it.
 
-- Two machines editing **different** namespaces merge; the second sees the
-  first's revision and keeps it.
-- Two machines editing the **same** namespace: the later write wins wholesale
-  for that namespace, which is the same rule the file-backed provider applies
-  to one document.
-- `modifyRecord` holds the read and the write in one exclusive section in
-  process and retries under the ETag across processes, so a token refresh on
-  two machines cannot drop one of them.
+```sh
+dsh plugin --profile web add dsh-oss-sync@0.2.0
+```
 
-Reads never wait on storage: resolution is served from the document this
-process last read, wrote, or polled. `DSH_SYNC_POLL_MS` is therefore the
-propagation window between machines.
+On Desktop, install `dsh-oss-sync@0.2.0` from the Plugins page, then restart.
+What happens on the first start, once per profile:
+
+- **Harness imports `$DSH_HOME/settings.yaml`** into the profile and renames it
+  `settings.yaml.imported`. With 0.1.x installed that file was a pre-install
+  copy, so it may be stale; the next steps supersede it.
+- **The 0.1.x cache is imported.** 0.1.x kept the live settings in
+  `$DSH_HOME/.dsh-oss-sync/settings.yaml.cache`. Its sections are written into
+  the profile, and the connection the 0.1.x page saved (bucket, endpoint,
+  region, prefix, addressing, poll interval) is written into the
+  `oss-settings` row — unless this profile already has a bucket.
+- **The first sync runs**: the bucket's sections win over the profile's, and
+  sections only this profile holds are uploaded.
+- **The bucket credentials keep working.** A pair the 0.1.x page saved in
+  `connection.yaml` is still read as a machine-wide fallback. Save a pair in
+  the section to override it, or press **清除** to retire it.
+
+Other changes from 0.1.x:
+
+- Settings are no longer replaced: the `settings` row stays mounted, and this
+  plugin syncs through it. Harness 0.1.7 keeps settings per profile, so each
+  profile syncs on its own; the old global document is gone.
+- Settings reads no longer depend on the bucket or a cache — the profile is
+  the local copy — so an unreachable bucket delays propagation and nothing
+  else. An edit made offline is uploaded by the first sync that reaches the
+  bucket.
+- Secret form fields are not synced.
+- `scripts/patch-desktop-asar.mjs` is removed.
+
+To go back, reinstall `dsh-oss-sync@0.1.x` together with a Harness older than
+0.1.7.
 
 ## Security — read this before you deploy
 
@@ -330,87 +350,112 @@ logging. If that is not enough, the right change is a credential provider that
 encrypts the document under a passphrase-derived key — the seam leaves room
 for it, and nothing above the seam changes.
 
-The access key itself must come from the machine's environment, never from a
-synced document: it is the bootstrap credential.
+The bucket's own access key must never come from a synced document: it is the
+bootstrap credential.
 
 ## Known limitations
 
+- **Settings apply on the poll.** Another machine's edit arrives within
+  `pollMs`; **立即同步** applies it now.
+- **Same-entry conflicts resolve last-writer-wins** for the whole entry.
+- **A pinned profile row.** Harness stores an entry's complete config in the
+  profile once anything in it is saved, and an applied section is saved the
+  same way: later bundle default changes to that entry stop reaching the
+  profile until the entry is reset. This is Harness's own form behavior.
+- **Only form fields sync.** The document carries volatile Config fields —
+  what the settings pages edit. Ordinary Config a hand edit adds to the
+  profile patch stays local.
 - **A macOS Desktop shell without an Edit menu cannot copy from any text field.**
-  macOS delivers ⌘C and ⌘V as menu key equivalents, so an Electron application
-  menu built without `role: 'editMenu'` leaves cut, copy, paste, and select-all
-  dead across the whole interface — plugin cards included. Windows and Linux are
-  unaffected, because Chromium handles the Ctrl equivalents inside the renderer.
-  The card's **复制** control goes through `navigator.clipboard` rather than the
-  menu, so it is the one route a masked field has until that menu item exists.
-- **The configuration section is not verified on screen.** The browser half
-  exists, is discovered, is served, and evaluates without error; `pnpm test:card`
-  materializes the built bundle against a stubbed module table and asserts the
-  section's markup from that; and the host half behind it is covered by the
-  smoke test. What none of those cover is CSS: no run has confirmed how the
-  section renders in a browser, so treat its layout as unproven.
-- **No `.env` fallback.** `dsh-credentials-local` layers the process
-  environment, the stored file, `<cwd>/.env`, and `$DSH_HOME/.env`. This
-  provider layers the environment and the bucket only. Put values that used to
-  live in a `.env` into the store, or keep exporting them.
-- **No "Open configuration file" affordance.** The settings page offers that
-  button only when the provider names a local document; object storage has
-  none, so the button disappears. Editing happens in the page or in the bucket.
-- **Deletes propagate, but not conflicts.** A namespace removed by another
-  machine disappears from this one on the next poll. Simultaneous conflicting
-  edits to one namespace resolve last-writer-wins for that namespace.
-- **Offline writes fail.** Reads fall back to the cache; a write with no
-  reachable bucket rejects, and the seam keeps the previous value. There is no
-  offline queue.
+  The section's **复制** control goes through `navigator.clipboard` rather than
+  the menu, so it is the one route a masked field has until that menu item
+  exists.
+- **The configuration section is not verified on screen.** `pnpm test:card`
+  materializes the built bundle against a stubbed module table and asserts its
+  markup and interaction; the host half is covered by the smoke test and a boot
+  against a real 0.1.7 runtime. No run has confirmed the CSS in a browser.
+- **No `.env` fallback for credentials.** `dsh-credentials-local` layers the
+  process environment, the stored file, `<cwd>/.env`, and `$DSH_HOME/.env`.
+  This provider layers the environment and the bucket only.
+- **Offline credential writes fail.** Credential reads fall back to the cache;
+  a credential write with no reachable bucket rejects. There is no offline
+  queue for credentials.
 - **One bucket per document pair.** Settings and credentials share a prefix
-  and therefore a bucket; point two providers at different buckets only by
-  editing the inserted rows.
+  and therefore a bucket.
 
 ## How it works
 
-Two rows of the `dsh-base` composition are replaced:
+The bundle patch (`cordis.patch.yml`) does two things to the `dsh-base`
+composition:
 
-| Base row | Base package | Replaced by |
+| Row | Base package | This bundle |
 |---|---|---|
-| `settings` | `@deepseek-ai/dsh-settings-file` (`$DSH_HOME/settings.yaml`) | `dsh-oss-sync/settings` |
-| `credentials` | `@deepseek-ai/dsh-credentials-local` (`$DSH_HOME/.credentials.yaml`) | `dsh-oss-sync/credentials` |
+| `settings` | `@deepseek-ai/dsh-settings` | left mounted; `oss-settings` (`dsh-oss-sync`) is inserted beside it and syncs through `ctx.settings` |
+| `credentials` | `@deepseek-ai/dsh-credentials-local` (`$DSH_HOME/.credentials.yaml`) | disabled; `oss-credentials` (`dsh-oss-sync/credentials`) is inserted on its own id |
 
 A loader patch cannot rename a row — its `name` is an assertion the patch must
-match — so `cordis.patch.yml` disables both base rows and inserts these two on
-their own ids (`oss-settings`, `oss-credentials`).
+match — which is why the credential store is replaced by disabling and
+inserting.
 
-Two consequences of the harness's own loading rules shape the package layout,
-which is why it looks the way it does:
+`oss-settings` declares its connection, scope, request, and status fields
+`.volatile()`. That is what makes them a settings form (the Plugins-page
+section edits them through `ctx.configForms`), and what lets a saved edit reach
+the running plugin as a `loader/volatile-update` instead of a remount. It also
+provides `ossSyncControl`, through which the credentials half follows the
+connection and reports its status.
 
-- The package root (`lib/index.js`) is the settings provider rather than a
-  subpath entry, because the browser module scan resolves a package's
-  `dsh.client` bundle from a Loader row named by a **bare package specifier** —
-  a row named `dsh-oss-sync/settings` is permanently not a client row.
+Two consequences of the harness's own loading rules shape the package layout:
+
+- The package root (`lib/index.js`) is the settings sync rather than a subpath
+  entry, because the browser module scan resolves a package's `dsh.client`
+  bundle from a Loader row named by a **bare package specifier**.
 - `lib/client.js` is not an ES module. The combo route concatenates several
-  packages into one script, so a top-level `import` in any one of them is
-  invalid at that position and breaks the whole script. The bundle is a lazy
-  CommonJS factory wrapped in `window.__ModuleLoader__.load({ id, factory })`.
+  packages into one script, so a top-level `import` in any one of them would
+  break the whole script. The bundle is a lazy CommonJS factory wrapped in
+  `window.__ModuleLoader__.load({ id, factory })`.
 
 ## Development
 
 ```sh
 pnpm install
 pnpm build          # tsc → lib/, then esbuild → lib/client.js
-pnpm smoke          # fake-S3 end-to-end checks
-pnpm test:card      # the browser card, against a stubbed module table
-pnpm test:patch     # the app.asar patcher, on a synthetic archive
+pnpm smoke          # fake-S3 and fake-settings end-to-end checks
+pnpm test:card      # the browser section, against a stubbed module table
+pnpm test           # both
 ```
 
 `tsconfig.json` resolves the `@deepseek-ai/*` peer packages through `paths`
 into a sibling `deepseek-harness` checkout's built declarations, so that
-checkout has to be built before this one compiles.
+checkout has to be built (at 0.1.7 or later) before this one compiles.
 
 `lib/` is what the loader loads: rebuild after every source change, then
-restart the profile. When running the harness from source (`pnpm dsh` from the
-checkout, which loads through tsx), a `--patch` overlay pointing straight at
-`src/settings.ts` gives a faster loop than a rebuild.
+restart the profile.
 
 See [CONTRIBUTING.md](https://github.com/jackchun53/dsh-oss-sync/blob/main/CONTRIBUTING.md)
 for publishing and the rest of the maintainer-facing detail.
+
+## Changelog
+
+### 0.2.0
+
+- Requires Harness 0.1.7. Settings are synced through the public settings
+  API instead of replacing the settings store; the `settings` row stays
+  mounted, which fixes the Desktop startup failure 0.1.x causes on 0.1.7.
+- Per-entry three-way sync with a per-profile baseline: no echo, an existing
+  bucket wins on first sync, an empty bucket is seeded, local-only entries
+  merge in.
+- Secrets, `!!js` expressions, the shell executors, and this plugin's rows
+  never reach the bucket; `include` / `exclude` set the scope.
+- The Plugins-page section edits the `oss-settings` row's live Config; the
+  bucket pair is saved in the profile, with the 0.1.x `connection.yaml` kept as
+  a fallback.
+- One-time import of the 0.1.x settings cache and connection per profile.
+- `scripts/patch-desktop-asar.mjs` removed; Desktop 0.1.7 has no peer-range
+  validator to patch.
+
+### 0.1.x
+
+Settings and credential providers replacing the file-backed stores, for
+Harness 0.1.5–0.1.6.
 
 ## License
 

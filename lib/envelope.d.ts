@@ -1,8 +1,8 @@
 /**
- * The revision envelope every synced object carries, plus the two pieces of
- * per-machine state a conditional writer needs: a stable device id, and a
- * cache of the last document read so an offline launch still starts from the
- * configuration this machine last saw.
+ * The revision envelope every synced object carries, plus the per-machine
+ * state a conditional writer needs: a stable device id, a cache of the last
+ * credential document read so an offline launch still starts from the keys
+ * this machine last saw, and each profile's settings-sync baseline.
  *
  * @module dsh-oss-sync/envelope
  */
@@ -52,16 +52,17 @@ export declare class SyncState {
     private device;
     constructor(dir: string);
     /**
-     * Read the connection credentials the settings page saved on this machine.
+     * Read the bucket credentials a 0.1.x settings page saved on this machine.
      *
-     * They are the one thing that cannot travel in the document: reading the
-     * document needs them. The file stays on this machine at mode 0600 and is
-     * never part of what syncs.
+     * 0.2.0 saves the pair in the profile instead; this file stays a read-only
+     * fallback beneath it, so an upgraded machine keeps reaching its bucket. The
+     * file stays on this machine at mode 0600 and is never part of what syncs.
      * @returns the stored pair, or `undefined` while this machine holds none.
      */
     readConnection(): Promise<StoredConnection | undefined>;
     /**
-     * Replace this machine's copy, or remove the file when the page cleared both.
+     * Replace the machine-wide pair, or remove the file when the page cleared
+     * the pair; 0.2.0 only ever removes it.
      * @param connection - the pair to store; omitting one, or both, is a clear.
      */
     writeConnection(connection?: StoredConnection): Promise<void>;
@@ -90,6 +91,19 @@ export declare class SyncState {
      * @param envelope - the envelope last read from or written to storage.
      */
     writeCache<T>(name: string, envelope: Envelope<T>): Promise<void>;
+    /**
+     * Read one YAML state file this plugin wrote, such as a profile's sync
+     * baseline.
+     * @param relative - path below the state directory, `/`-separated.
+     * @returns the parsed value, or `undefined` when absent or unreadable.
+     */
+    readState<T>(relative: string): Promise<T | undefined>;
+    /**
+     * Replace one YAML state file.
+     * @param relative - path below the state directory, `/`-separated.
+     * @param value - the plain data to store.
+     */
+    writeState(relative: string, value: unknown): Promise<void>;
     /** Cache path for one object; the prefix is already part of the configured directory. */
     private cachePath;
     /** One-time import marker for the file-backed provider this object replaced. */

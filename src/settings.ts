@@ -1,722 +1,759 @@
 /**
- * User settings stored in an S3-compatible bucket instead of a local file.
+ * Settings sync over the Harness 0.1.7 settings service.
  *
- * One object holds the whole document — the same namespace-to-section mapping
- * `dsh-settings-file` keeps in `settings.yaml` — wrapped in a revision
- * envelope. A write presents the ETag it read, so two machines can never
- * overwrite each other silently; a poll publishes another machine's committed
- * revision into the seam, which re-resolves every registered namespace.
+ * Harness 0.1.7 has no settings document store to replace: every configurable
+ * value is a plugin's volatile Config field, `ctx.settings` projects those
+ * fields into forms, and a write lands in the active profile's
+ * `cordis.patch.yml` through the configuration editor. So this half no longer
+ * sits under the seam. It sits beside it, as a client of the public API:
  *
- * This provider also owns the `oss-sync` namespace, which is how the settings
- * page reads and drives the sync: the editable connection parameters, the
- * runtime status both providers report, and the request token a card writes.
+ * - it reads the profile's form sections with `describe({ redactSecrets })`,
+ *   so secrets never leave the machine, and leaves `!!js` expressions out;
+ * - it keeps one object in the bucket mapping entry id to section, wrapped in
+ *   the revision envelope and written under an ETag precondition;
+ * - it applies a section another machine committed with `replace()` fenced by
+ *   the entry's describe revision, restoring this profile's own secrets and
+ *   expressions into the section first;
+ * - it reconciles per entry against the baseline of its last sync, recorded
+ *   after every apply, so an applied change is never uploaded back.
+ *
+ * It also owns the connection: its own Config is what the Plugins-page
+ * section edits, and it provides `ossSyncControl`, through which the credential
+ * provider follows that connection and reports its status.
  *
  * @module dsh-oss-sync/settings
  */
 
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
-import { SettingsProvider, type SettingsNamespace, type SettingsScope } from '@deepseek-ai/dsh-settings'
-import z from '@deepseek-ai/schemastery'
+import { createVolatile, isVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
+import type { SettingsForms } from '@deepseek-ai/dsh-settings'
 import {
-  ConfigSchema, applyOverrides, mergeConnection, resolveConfig, sameConnection, type Config, type ResolvedConfig,
+  DEFAULT_EXCLUDE, OWN_ENTRIES, SyncConfigSchema, clearsConnection, locationKey, mergeConnection, readConfig,
+  resolveConfig, resolveDshHome, sameConnection, type Config, type ResolvedConfig,
 } from './config.js'
 import {
-  LOCAL_CREDENTIAL_FIELDS, SYNC_NAMESPACE, requestVerb, storedDocument, storedSection, type SyncControl,
-  type SyncParticipant, type SyncSettings, type SyncStatus, type SyncStatusMap,
+  LEGACY_SYNC_NAMESPACE, SYNC_ENTRY, requestVerb, type SyncControl, type SyncParticipant, type SyncStatus,
+  type SyncStatusMap,
 } from './control.js'
 import {
-  ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope, type StoredConnection,
-} from './envelope.js'
-import { readLegacySettings } from './legacy.js'
+  aliasDocument, expressionPaths, getPath, isMapping, isSynced, planSync, sameSection, setPath, withoutExpressions,
+  type SettingsDocument, type SyncBaseline,
+} from './document.js'
+import { ENVELOPE_VERSION, SyncState, encodeEnvelope, parseEnvelope, type Envelope, type StoredConnection } from './envelope.js'
 import { PollLoop } from './poll.js'
 import { ObjectStore, PreconditionFailedError } from './store.js'
 
-/** This provider's key in the namespace's status map. */
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /** Instance-local notice from the Loader after it committed volatile Config values. */
+    'loader/volatile-update'(paths: readonly (readonly string[])[]): void
+  }
+}
+
+/** This half's key in the status map. */
 const STATUS_LABEL = 'settings'
 
 /** Object name under the configured prefix. */
 const OBJECT_NAME = 'settings.yaml'
 
-/** Attempts a conditional write makes against a moving object before giving up. */
+/** Attempts one sync makes against a moving object before giving up until the next one. */
 const MAX_WRITE_ATTEMPTS = 5
 
-/** One settings document: namespace to raw user section. */
-type SettingsDocument = Record<string, Record<string, unknown>>
+/** How long a burst of local edits settles before it is uploaded. */
+const LOCAL_SETTLE_MS = 1000
 
-/** Schema of the namespace the settings page binds to. */
-const SyncSettingsSchema: z<SyncSettings> = z.object({
-  bucket: z.string(),
-  endpoint: z.string(),
-  region: z.string(),
-  prefix: z.string(),
-  pollMs: z.number().min(1000),
-  forcePathStyle: z.boolean(),
-  accessKeyIdEnv: z.string(),
-  secretAccessKeyEnv: z.string(),
-  accessKeyId: z.string(),
-  secretAccessKey: z.string(),
-  status: z.any(),
-  request: z.string(),
-})
+/** Config fields whose change moves or re-authenticates the store. */
+const CONNECTION_FIELDS = new Set([
+  'bucket', 'endpoint', 'region', 'prefix', 'forcePathStyle', 'accessKeyIdEnv', 'secretAccessKeyEnv',
+  'accessKeyId', 'secretAccessKey',
+])
 
-/** Object key for one resolved prefix. */
-function objectKey(spec: ResolvedConfig): string {
-  return `${spec.prefix}/${OBJECT_NAME}`
+/** 0.1.x connection fields the one-time migration carries into this profile. */
+const LEGACY_CONNECTION_FIELDS = [
+  'bucket', 'endpoint', 'region', 'prefix', 'forcePathStyle', 'pollMs', 'accessKeyIdEnv', 'secretAccessKeyEnv',
+] as const
+
+/** The part of the settings service this half uses. */
+type SettingsService = Pick<SettingsForms, 'describe' | 'replace' | 'update'>
+
+/** One described entry, as `describe()` reports it. */
+type Descriptor = ReturnType<SettingsService['describe']>[number]
+
+/** The Config the Loader hands this plugin: volatile references for every live field. */
+type SyncConfigInput = ReturnType<typeof SyncConfigSchema>
+
+/** Structural view of the Harness profile context, which this plugin does not depend on. */
+interface ProfileFacts {
+  name?: string
+  home?: string
+}
+
+/** Structural view of the Loader, which this plugin does not depend on. */
+interface LoaderFacts {
+  await?: () => Promise<unknown>
+}
+
+/** Top-level field names a form schema envelope declares, when it declares an object. */
+function schemaFields(schema: unknown): Set<string> | undefined {
+  if (!isMapping(schema)) return undefined
+  const refs = schema['refs']
+  const root = isMapping(refs) ? refs[String(schema['uid'])] : undefined
+  if (!isMapping(root) || root['type'] !== 'object' || !isMapping(root['dict'])) return undefined
+  return new Set(Object.keys(root['dict']))
+}
+
+/** Plain JSON copy with `undefined` members removed, fit for a volatile snapshot. */
+function plainJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+/** Wait without keeping the process alive. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms).unref() })
 }
 
 /**
- * Settings provider backed by one object in an S3-compatible bucket.
+ * The settings sync and the connection owner.
  *
- * Reads are served from the document this process last read, wrote, or
- * polled, so a model request never waits on storage; the poll interval is the
- * propagation window between machines. Writes are conditional: a machine that
- * read a stale revision re-reads, re-applies its own section over the newer
- * document, and retries, so concurrent edits on different machines merge
- * instead of erasing each other.
+ * It needs `ctx.settings` to sync and runs local-only without it; the
+ * coordination handle is provided either way, so the credential provider can
+ * always follow the connection.
  */
-export class OssSettingsProvider extends SettingsProvider {
-  static Config: z<Config> = ConfigSchema
+export class OssSettingsSync extends Service implements SyncControl {
+  static Config = SyncConfigSchema
 
-  /** Parameters the entry config supplies; the namespace overrides them. */
-  private readonly bootstrap: ResolvedConfig
-  /** The bucket credentials this machine saved from the settings page, if any. */
-  private connection: StoredConnection | undefined
+  /** The plugin's own context: the one its listeners and logs belong to. */
+  private readonly owner: Context
   private readonly state: SyncState
+  /** The machine-wide bucket pair a 0.1.x install saved, read as a fallback layer. */
+  private legacyConnection: StoredConnection | undefined
   /** Parameters in force now. */
   private spec: ResolvedConfig
-  private store: ObjectStore
+  /** The store in force; `undefined` while the configured connection cannot be built. */
+  private store: ObjectStore | undefined
+  /** Why the configured connection cannot be built, when it cannot. */
+  private storeError: string | undefined
   private key: string
   private readonly poll: PollLoop
-  private scope: SettingsScope<SyncSettings> | undefined
-  /** Last request token this provider acted on. */
+  /** The settings service while it is mounted. */
+  private settings: SettingsService | undefined
+  /** Set once the migration and the first sync may run: the Loader settled every entry. */
+  private started = false
+  /** The baseline of the last sync at the current location, once read. */
+  private baseline: SyncBaseline | undefined
+  private baselineLoaded = false
+  /** Last request token acted on; the one present at boot counts as handled. */
   private handled: string | undefined
-  /** Status each participant last reported. */
   private readonly status: SyncStatusMap = {}
+  /** Canonical text of the status last announced to the page, timestamps aside. */
+  private announced = ''
   private readonly participants = new Map<string, SyncParticipant>()
-  /**
-   * The document this process considers current. It is what the seam holds
-   * and what a deferred publish republishes, so a publish can never resurrect
-   * a superseded local view.
-   */
-  private local: SettingsDocument = {}
-  /** ETag of the revision {@link local} reflects; `undefined` until one is read. */
-  private etag: string | undefined
-  /** Revision number {@link etag} belongs to. */
-  private revision = 0
-  /** Serializes remote reads and writes, so a poll never interleaves a write. */
+  private readonly connectionListeners = new Set<() => void>()
   private operations: Promise<void> = Promise.resolve()
-  /** Set at dispose: refuse new work and let in-flight work settle. */
+  private settleTimer: NodeJS.Timeout | undefined
   private closed = false
+  /** Settles once the migration and the first sync ran, for callers that must observe them. */
+  private startedSignal: () => void = () => {}
+  readonly whenStarted: Promise<void> = new Promise((resolve) => { this.startedSignal = resolve })
 
-  constructor(ctx: Context, config: Config) {
-    super(ctx)
-    this.bootstrap = resolveConfig(config)
-    this.state = new SyncState(this.bootstrap.stateDir)
-    this.spec = this.bootstrap
-    this.store = new ObjectStore(this.spec)
-    this.key = objectKey(this.spec)
-    this.poll = new PollLoop(this.spec.pollMs, () => this.refresh(), (error: unknown) => {
-      this.ctx.logger.error('dsh-oss-sync: settings poll failed at %s', this.key)
-      this.ctx.logger.error(error)
+  constructor(ctx: Context, private readonly config: SyncConfigInput) {
+    super(ctx, 'ossSyncControl')
+    this.owner = ctx
+    const plain = readConfig(config)
+    this.handled = plain.request
+    this.spec = resolveConfig(plain)
+    this.state = new SyncState(this.spec.stateDir)
+    this.key = `${this.spec.prefix}/${OBJECT_NAME}`
+    this.poll = new PollLoop(this.spec.pollMs, () => this.sync(), (error: unknown) => {
+      this.owner.logger.error('dsh-oss-sync: settings poll failed at %s', this.key)
+      this.owner.logger.error(error)
     })
   }
 
-  /** Storage is always writable through {@link SettingsProvider.persist}. */
-  override get writable(): boolean {
-    return true
+  // ── the coordination handle ────────────────────────────────────────────
+
+  join(label: string, participant: SyncParticipant): () => void {
+    this.participants.set(label, participant)
+    return () => { this.participants.delete(label) }
+  }
+
+  report(label: string, patch: Partial<SyncStatus>): void {
+    const previous = this.status[label]
+    this.status[label] = {
+      state: 'idle',
+      configured: false,
+      revision: 0,
+      writer: '',
+      updatedAt: '',
+      deviceId: '',
+      objectKey: '',
+      ...previous,
+      ...patch,
+    }
+    this.publishStatus()
+  }
+
+  connection(): ResolvedConfig {
+    return this.spec
+  }
+
+  onConnection(listener: () => void): () => void {
+    this.connectionListeners.add(listener)
+    return () => { this.connectionListeners.delete(listener) }
+  }
+
+  // ── lifecycle ──────────────────────────────────────────────────────────
+
+  async* [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void> {
+    this.legacyConnection = await this.state.readConnection()
+    const plain = readConfig(this.config)
+    if (clearsConnection(plain)) await this.forgetLegacyConnection()
+    this.adoptConnection(this.desiredSpec(plain))
+    // A participant that read the connection before the machine-wide pair was
+    // folded in follows the completed one.
+    this.notifyConnection()
+    const preflightError = await this.preflight()
+    this.report(STATUS_LABEL, {
+      state: preflightError === undefined && this.storeError === undefined ? 'idle' : 'error',
+      lastError: preflightError ?? this.storeError,
+      deviceId: await this.state.deviceId(),
+      objectKey: this.key,
+    })
+    this.owner.on('loader/volatile-update', (paths) => { void this.onVolatileUpdate(paths) })
+    this.owner.inject(['settings'], (settingsCtx) => {
+      const settings = settingsCtx.settings
+      this.settings = settings
+      settingsCtx.on('settings/document-updated', (ns) => {
+        if (this.syncs(String(ns))) this.schedule()
+      })
+      settingsCtx.effect(() => () => {
+        if (this.settings === settings) this.settings = undefined
+      }, 'dsh-oss-sync: settings service')
+      void this.start(settings)
+    })
+    this.applyPoll()
+    yield async () => {
+      this.closed = true
+      clearTimeout(this.settleTimer)
+      await this.poll.stop()
+      await this.operations
+      this.store?.destroy()
+    }
   }
 
   /**
-   * Read the stored document once at registration. An unreachable service
-   * falls back to the cache this machine last saw, because a laptop that
-   * starts offline must still boot with its own configuration; a stored
-   * object that is not an envelope this plugin understands is refused.
+   * Begin syncing once the Loader settled every entry: the forms describe only
+   * active entries, and Harness imports `settings.yaml` at the same point.
+   * @param settings - the settings service this start belongs to.
    */
-  protected override async load(): Promise<Record<string, unknown>> {
-    // With no bucket there is no remote to read, and nothing to report: the
-    // page is about to be where one is set.
-    if (!this.store.configured) return await this.loadCache() ?? {}
+  private async start(settings: SettingsService): Promise<void> {
     try {
-      const remote = await this.store.read(this.key)
-      if (remote === undefined) {
-        // No stored revision yet: keep whatever this machine last cached, so
-        // the first writer seeds the bucket instead of erasing its own state.
-        const cached = await this.loadCache()
-        if (cached === undefined) return {}
-        this.ctx.logger.warn('dsh-oss-sync: %s does not exist yet; seeding from the local cache', this.key)
-        return cached
-      }
-      const envelope = parseEnvelope<SettingsDocument>(remote.text)
-      return this.adopt(envelope, remote.etag)
+      const loader = this.lookup('loader') as LoaderFacts | undefined
+      await loader?.await?.()
+      await this.awaitHarnessImport()
+      if (this.closed || this.settings !== settings) return
+      await this.migrate(settings)
+      this.started = true
+      await this.sync()
     } catch (error) {
-      this.ctx.logger.warn('dsh-oss-sync: could not read %s; running from the local cache', this.key)
-      this.ctx.logger.warn(error)
-      return await this.loadCache() ?? {}
+      this.owner.logger.error('dsh-oss-sync: could not start the settings sync')
+      this.owner.logger.error(error)
+      this.report(STATUS_LABEL, { state: 'error', lastError: String(error) })
+    } finally {
+      this.startedSignal()
     }
   }
 
   /**
-   * This machine's own copy of the document: what a start without a bucket and
-   * an unreachable bucket both fall back to.
-   * @returns the cached document, or `undefined` while this machine has none.
+   * Let Harness's own one-time `settings.yaml` import run first, so the
+   * migration below lands over it rather than under it.
    */
-  private async loadCache(): Promise<SettingsDocument | undefined> {
-    const cached = await this.state.readCache<SettingsDocument>(OBJECT_NAME)
-    let document = cached?.doc
-    let revision = cached?.rev ?? 0
-    if (!await this.state.legacyImported(OBJECT_NAME)) {
-      try {
-        const legacy = await readLegacySettings()
-        if (legacy !== undefined) {
-          // The sync cache wins conflicts: it may contain edits made after the
-          // plugin was installed. The legacy file only restores namespaces the
-          // first build failed to carry across.
-          document = { ...legacy, ...document }
-          const envelope: Envelope<SettingsDocument> = {
-            v: ENVELOPE_VERSION,
-            rev: revision,
-            writer: cached?.writer ?? await this.state.deviceId(),
-            updatedAt: cached?.updatedAt ?? new Date().toISOString(),
-            doc: document,
+  private async awaitHarnessImport(): Promise<void> {
+    const home = this.profile().home ?? resolveDshHome()
+    const legacy = join(home, 'settings.yaml')
+    if (!existsSync(legacy)) return
+    for (let waited = 0; waited < 10_000 && existsSync(legacy); waited += 100) await delay(100)
+    // The rename is Harness's first step; its section writes follow it.
+    await delay(1500)
+  }
+
+  /** The profile this process runs, as far as it can be told. */
+  private profile(): ProfileFacts {
+    return (this.lookup('profileContext') as ProfileFacts | undefined) ?? {}
+  }
+
+  /** Read a service this plugin does not declare types for. */
+  private lookup(name: string): unknown {
+    return (this.owner as unknown as { get: (name: string) => unknown }).get(name)
+  }
+
+  /** State path of one file belonging to this profile's sync. */
+  private profileState(name: string): string {
+    const profile = (this.profile().name ?? 'default').replace(/[^\w.-]/gu, '_')
+    return `profiles/${profile}/${name}`
+  }
+
+  // ── migration from 0.1.x ───────────────────────────────────────────────
+
+  /**
+   * Carry what a 0.1.x install held only in its own cache into this profile,
+   * once per profile: the connection the page saved (when this profile has no
+   * bucket yet), and the settings sections of a machine that never had a
+   * bucket, whose cache was their only copy.
+   * @param settings - the settings service.
+   */
+  private async migrate(settings: SettingsService): Promise<void> {
+    const marker = this.profileState('migrated-0.1.yaml')
+    if (await this.state.readState(marker) !== undefined) return
+    const cached = await this.state.readCache<Record<string, unknown>>(OBJECT_NAME)
+    const document = cached?.doc
+    if (document !== undefined) {
+      const legacyConnection = document[LEGACY_SYNC_NAMESPACE]
+      if (isMapping(legacyConnection) && (readConfig(this.config).bucket ?? '').length === 0) {
+        const fields = Object.fromEntries(LEGACY_CONNECTION_FIELDS
+          .filter(field => legacyConnection[field] !== undefined)
+          .map(field => [field, legacyConnection[field]]))
+        if (typeof fields['bucket'] === 'string' && fields['bucket'].length > 0) {
+          try {
+            await settings.update(SYNC_ENTRY, fields)
+            this.owner.logger.info('dsh-oss-sync: carried the 0.1.x connection into this profile')
+          } catch (error) {
+            this.owner.logger.warn('dsh-oss-sync: could not carry the 0.1.x connection into this profile')
+            this.owner.logger.warn(error)
           }
-          await this.state.writeCache(OBJECT_NAME, envelope)
-          this.ctx.logger.info('dsh-oss-sync: imported the existing settings.yaml into the sync cache')
         }
-        await this.state.markLegacyImported(OBJECT_NAME)
+      }
+      const described = new Map(settings.describe({ redactSecrets: true }).map(view => [String(view.ns), view]))
+      for (const [entry, section] of Object.entries(aliasDocument(document))) {
+        const view = described.get(entry)
+        if (view === undefined || !this.syncs(entry)) continue
+        const fields = schemaFields(view.schema)
+        const patch = Object.fromEntries(Object.entries(section).filter(([field]) => fields?.has(field) ?? true))
+        if (Object.keys(patch).length === 0) continue
+        try {
+          await settings.update(entry, patch)
+        } catch (error) {
+          this.owner.logger.warn('dsh-oss-sync: section %s of the 0.1.x cache was not imported', entry)
+          this.owner.logger.warn(error)
+        }
+      }
+      this.owner.logger.info('dsh-oss-sync: imported the 0.1.x settings cache into this profile')
+    }
+    await this.state.writeState(marker, { v: 1, at: new Date().toISOString() })
+  }
+
+  // ── connection ─────────────────────────────────────────────────────────
+
+  /** The parameters Config and the machine-wide fallback resolve to now. */
+  private desiredSpec(plain: Config = readConfig(this.config)): ResolvedConfig {
+    return mergeConnection(resolveConfig(plain), this.legacyConnection, clearsConnection(plain))
+  }
+
+  /** Retire the machine-wide pair a 0.1.x install saved; the page cleared the pair. */
+  private async forgetLegacyConnection(): Promise<void> {
+    if (this.legacyConnection === undefined) return
+    this.legacyConnection = undefined
+    await this.state.writeConnection()
+  }
+
+  /**
+   * Build the store for one parameter set. A connection that cannot be built —
+   * half a credential pair — is a status line, not a failure: the page is
+   * where it gets repaired.
+   * @param desired - the parameters to adopt.
+   */
+  private adoptConnection(desired: ResolvedConfig): void {
+    this.store?.destroy()
+    this.store = undefined
+    this.storeError = undefined
+    this.spec = desired
+    this.key = `${desired.prefix}/${OBJECT_NAME}`
+    try {
+      this.store = new ObjectStore(desired)
+    } catch (error) {
+      this.storeError = String(error)
+      this.owner.logger.error('dsh-oss-sync: the configured connection cannot be used')
+      this.owner.logger.error(error)
+    }
+  }
+
+  /** Whether a bucket is set and a store could be built for it. */
+  private get configured(): boolean {
+    return this.store?.configured === true
+  }
+
+  /**
+   * Report a bucket this process cannot authenticate against yet.
+   * @returns the failure's text, or `undefined` when preflight passed (including local-only).
+   */
+  private async preflight(): Promise<string | undefined> {
+    try {
+      await this.store?.preflight()
+      return undefined
+    } catch (error) {
+      this.owner.logger.error('dsh-oss-sync: storage is not usable yet')
+      this.owner.logger.error(error)
+      return String(error)
+    }
+  }
+
+  /** Poll only while a bucket is configured. */
+  private applyPoll(): void {
+    if (this.configured) this.poll.start()
+    else this.poll.pause()
+  }
+
+  /**
+   * React to the Loader committing new volatile values: the page saved a
+   * connection, a poll interval, the scope, or a request token.
+   * @param paths - the changed Config paths.
+   */
+  private async onVolatileUpdate(paths: readonly (readonly string[])[]): Promise<void> {
+    if (this.closed) return
+    const fields = new Set(paths.map(path => path[0] ?? ''))
+    const plain = readConfig(this.config)
+    try {
+      if ([...fields].some(field => CONNECTION_FIELDS.has(field))) await this.reconnect(plain)
+      if (fields.has('pollMs') && plain.pollMs !== undefined && plain.pollMs !== this.spec.pollMs) {
+        this.spec = { ...this.spec, pollMs: plain.pollMs }
+        this.poll.restart(plain.pollMs)
+        this.applyPoll()
+      }
+      if (fields.has('include') || fields.has('exclude')) this.schedule(0)
+      if (fields.has('request') && plain.request !== undefined && plain.request !== this.handled) {
+        this.handled = plain.request
+        await this.runRequested(plain.request)
+      }
+    } catch (error) {
+      this.owner.logger.error('dsh-oss-sync: could not apply the saved sync settings')
+      this.owner.logger.error(error)
+      this.report(STATUS_LABEL, { state: 'error', lastError: String(error) })
+    }
+    // The Loader resets the status reference whenever this entry's raw config
+    // moves; publishing again restores it.
+    this.announced = ''
+    this.publishStatus()
+  }
+
+  /**
+   * Move to the connection the page saved. A new location starts the sync
+   * over there: an existing document wins, and an empty one is seeded.
+   * @param plain - the Config values now in force.
+   */
+  private async reconnect(plain: Config): Promise<void> {
+    if (clearsConnection(plain)) await this.forgetLegacyConnection()
+    const desired = this.desiredSpec(plain)
+    if (sameConnection(desired, this.spec) && desired.prefix === this.spec.prefix) return
+    await this.enqueue(async () => {
+      this.adoptConnection({ ...desired, pollMs: this.spec.pollMs })
+      this.baseline = undefined
+      this.baselineLoaded = false
+    })
+    const preflightError = await this.preflight()
+    this.report(STATUS_LABEL, {
+      state: preflightError === undefined && this.storeError === undefined ? 'idle' : 'error',
+      lastError: preflightError ?? this.storeError,
+      objectKey: this.key,
+      revision: 0,
+      writer: '',
+      updatedAt: '',
+    })
+    this.applyPoll()
+    this.owner.logger.info('dsh-oss-sync: settings now sync with %s', this.configured ? this.key : 'nothing (local-only)')
+    this.notifyConnection()
+    this.schedule(0)
+  }
+
+  /** Tell every participant the connection moved. */
+  private notifyConnection(): void {
+    for (const listener of this.connectionListeners) {
+      try {
+        listener()
       } catch (error) {
-        this.ctx.logger.warn('dsh-oss-sync: could not import the existing settings.yaml; leaving it untouched')
-        this.ctx.logger.warn(error)
+        this.owner.logger.warn(error)
       }
     }
-    if (document === undefined) return undefined
-    this.local = document
-    this.revision = revision
+  }
+
+  /** Run the verb the page asked for on this half and every participant. */
+  private async runRequested(request: string): Promise<void> {
+    const verb = requestVerb(request)
+    this.owner.logger.info('dsh-oss-sync: %s requested from the Plugins page', verb)
+    const participants = [...this.participants.values()]
+    await Promise.allSettled(verb === 'push'
+      ? [this.sync('push'), ...participants.map(participant => participant.push())]
+      : [this.sync(), ...participants.map(participant => participant.refresh())])
+  }
+
+  // ── the sync ───────────────────────────────────────────────────────────
+
+  /** Whether one profile entry takes part in the sync under the current scope. */
+  private syncs(entry: string): boolean {
+    const plain = readConfig(this.config)
+    return isSynced(entry, plain.include ?? [], plain.exclude ?? DEFAULT_EXCLUDE, OWN_ENTRIES)
+  }
+
+  /** Sync after a burst of local edits settles. */
+  private schedule(ms = LOCAL_SETTLE_MS): void {
+    if (this.closed) return
+    clearTimeout(this.settleTimer)
+    this.settleTimer = setTimeout(() => { void this.sync() }, ms)
+    this.settleTimer.unref()
+  }
+
+  /**
+   * This profile's synced sections: the user layer of every described entry,
+   * secrets redacted and expressions left out. An entry with no user layer
+   * contributes an empty section, which is how a reset propagates.
+   * @param settings - the settings service.
+   * @returns the local document.
+   */
+  private snapshot(settings: SettingsService): SettingsDocument {
+    const document: SettingsDocument = {}
+    for (const view of settings.describe({ redactSecrets: true })) {
+      const entry = String(view.ns)
+      if (!this.syncs(entry)) continue
+      const section = withoutExpressions(view.user ?? {})
+      document[entry] = isMapping(section) ? section : {}
+    }
     return document
   }
 
   /**
-   * Store one namespace's next user section.
+   * Write one section another machine committed into this profile.
    *
-   * The write re-reads the object, keeps every section the newer revision
-   * carries, overlays this namespace's section, and commits under the ETag it
-   * read. A refusal means another machine committed in between: the loop
-   * re-reads and re-applies, so the loser of the race retries against the
-   * winner's document rather than overwriting it.
+   * `replace` resets the entry's live fields to what the bundles supply and
+   * sets the section over them, so a field the other machine cleared clears
+   * here too. The section never carries this profile's secrets or `!!js`
+   * expressions, so both are restored into it first; fields this Harness does
+   * not declare are dropped rather than refused.
+   * @param settings - the settings service.
+   * @param entry - the profile entry id.
+   * @param section - the section to apply.
    */
-  protected override async persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
-    // The sync namespace's own section carries runtime facts and this machine's
-    // bucket credentials; storage keeps the connection parameters and drops the
-    // rest.
-    const next = ns === SYNC_NAMESPACE ? storedSection(section) : section
-    if (ns === SYNC_NAMESPACE) await this.syncStoredConnection(section)
-    if (!this.store.configured) return this.commitLocally(ns, section, next)
+  private async apply(settings: SettingsService, entry: string, section: Record<string, unknown>): Promise<void> {
+    const redacted = settings.describe({ redactSecrets: true }).find(view => String(view.ns) === entry)
+    const full: Descriptor | undefined = settings.describe().find(view => String(view.ns) === entry)
+    if (redacted === undefined || full === undefined) throw new Error(`entry "${entry}" is no longer configurable`)
+    const fields = schemaFields(redacted.schema)
+    const next: Record<string, unknown> = structuredClone(Object.fromEntries(Object.entries(section)
+      .filter(([field]) => fields?.has(field) ?? true)))
+    for (const secret of redacted.secrets ?? []) {
+      const value = getPath(full.user, secret.path)
+      if (value !== undefined && secret.path.length > 0) setPath(next, secret.path, structuredClone(value))
+    }
+    for (const path of expressionPaths(full.user)) {
+      if (path.length > 0) setPath(next, path, structuredClone(getPath(full.user, path)))
+    }
+    await settings.replace(entry, next, redacted.revision)
+  }
+
+  /** Read this profile's baseline once per location. */
+  private async loadBaseline(): Promise<SyncBaseline | undefined> {
+    if (!this.baselineLoaded) {
+      const stored = await this.state.readState<SyncBaseline>(this.profileState('settings-sync.yaml'))
+      this.baseline = stored?.v === 1 && stored.location === locationKey(this.spec) ? stored : undefined
+      this.baselineLoaded = true
+    }
+    return this.baseline
+  }
+
+  /** Record what this profile and the bucket agree on now. */
+  private async saveBaseline(baseline: SyncBaseline): Promise<void> {
+    this.baseline = baseline
+    this.baselineLoaded = true
+    await this.state.writeState(this.profileState('settings-sync.yaml'), baseline)
+  }
+
+  /**
+   * Reconcile this profile with the bucket once.
+   * @param force - `push` re-commits every local section over the bucket's.
+   */
+  sync(force?: 'push'): Promise<void> {
     return this.enqueue(async () => {
+      const settings = this.settings
+      if (this.closed || !this.started || settings === undefined) return
+      const store = this.store
+      if (store === undefined || !store.configured) {
+        this.report(STATUS_LABEL, { state: this.storeError === undefined ? 'idle' : 'error', lastError: this.storeError })
+        return
+      }
       for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
         let remote
         try {
-          remote = await this.store.read(this.key)
+          remote = await store.read(this.key)
         } catch (error) {
-          // The sync namespace carries the connection itself: refusing its
-          // write would leave a machine whose store broke with no way to
-          // repair the connection from the page. The commit lands locally and
-          // the reconcile it triggers moves the document to what was saved.
-          // Other namespaces keep refusing: their edit must not look saved
-          // while it never reached storage.
-          if (ns === SYNC_NAMESPACE) {
-            this.ctx.logger.warn('dsh-oss-sync: cannot read %s before writing it; committing locally', this.key)
-            this.ctx.logger.warn(error)
-            return this.commitLocally(ns, section, next)
-          }
-          throw new Error(`dsh-oss-sync: cannot read ${this.key} before writing it: ${String(error)}`)
+          this.owner.logger.warn('dsh-oss-sync: could not read %s; keeping this profile as it is', this.key)
+          this.owner.logger.warn(error)
+          this.report(STATUS_LABEL, { state: 'error', lastError: String(error) })
+          return
         }
-        const stored = remote === undefined ? undefined : parseEnvelope<SettingsDocument>(remote.text)
-        // A vanished object with a revision already observed means another
-        // machine deleted the document; without one, a machine that started
-        // offline seeds storage from the state it already carries. Either way
-        // the runtime fields come off: the seam's document holds this process's
-        // status, and storage keeps configuration only.
-        const base: SettingsDocument = remote === undefined
-          ? (this.etag === undefined ? storedDocument(this.local) : {})
-          : stored === undefined ? {} : storedDocument(stored.doc)
-        const document: SettingsDocument = { ...base, [ns]: next }
-        const envelope: Envelope<SettingsDocument> = {
+        const envelope = remote === undefined ? undefined : parseEnvelope<Record<string, unknown>>(remote.text)
+        const stored = envelope?.doc ?? {}
+        const remoteView = aliasDocument(stored)
+        const baseline = await this.loadBaseline()
+        const local = this.snapshot(settings)
+        const readAt = new Date().toISOString()
+        if (force === undefined && baseline !== undefined && remote !== undefined && remote.etag === baseline.etag
+          && Object.keys(local).every(entry => sameSection(local[entry], baseline.local[entry]))) {
+          this.report(STATUS_LABEL, { state: 'idle', lastReadAt: readAt, lastError: undefined })
+          return
+        }
+        const plan = planSync(local, remoteView, baseline, force)
+        const applied: string[] = []
+        const failures: string[] = []
+        for (const [entry, section] of Object.entries(plan.apply)) {
+          try {
+            await this.apply(settings, entry, section)
+            applied.push(entry)
+          } catch (error) {
+            failures.push(`${entry}: ${String(error)}`)
+            this.owner.logger.warn('dsh-oss-sync: could not apply the stored section of %s', entry)
+            this.owner.logger.warn(error)
+          }
+        }
+        // The baseline moves past every apply before anything is uploaded: an
+        // applied section reads back as this profile's state, and must never
+        // look like a local change to send back.
+        const after = applied.length === 0 ? local : this.snapshot(settings)
+        const agreed: SyncBaseline = {
+          v: 1,
+          location: locationKey(this.spec),
+          ...remote === undefined ? {} : { etag: remote.etag },
+          rev: envelope?.rev ?? 0,
+          remote: remoteView,
+          local: { ...baseline?.local, ...after },
+        }
+        /**
+         * Keep an entry whose apply failed exactly as the previous baseline
+         * had it, so the next sync still sees the stored change and retries.
+         * @param agreement - the baseline about to be recorded.
+         * @returns the same baseline with the failed entries rolled back.
+         */
+        const retrying = (agreement: SyncBaseline): SyncBaseline => {
+          for (const entry of Object.keys(plan.apply).filter(name => !applied.includes(name))) {
+            for (const side of ['local', 'remote'] as const) {
+              const previous = baseline?.[side][entry]
+              if (previous === undefined) Reflect.deleteProperty(agreement[side], entry)
+              else agreement[side][entry] = previous
+            }
+          }
+          return agreement
+        }
+        const upload = Object.entries(plan.upload)
+        if (upload.length === 0) {
+          await this.saveBaseline(retrying(agreed))
+          if (applied.length > 0) {
+            this.owner.logger.info('dsh-oss-sync: applied %s from settings revision %d', applied.join(', '), agreed.rev)
+          }
+          this.report(STATUS_LABEL, {
+            state: failures.length === 0 ? 'idle' : 'error',
+            lastError: failures.length === 0 ? undefined : failures.join('; '),
+            revision: agreed.rev,
+            writer: envelope?.writer ?? '',
+            updatedAt: envelope?.updatedAt ?? '',
+            lastReadAt: readAt,
+            applied: applied.length === 0 ? undefined : applied,
+            uploaded: undefined,
+          })
+          return
+        }
+        if (applied.length > 0) await this.saveBaseline(retrying(agreed))
+        const document: Record<string, unknown> = { ...stored }
+        for (const [entry, section] of upload) document[entry] = section
+        const next: Envelope<Record<string, unknown>> = {
           v: ENVELOPE_VERSION,
-          rev: (stored?.rev ?? 0) + 1,
+          rev: (envelope?.rev ?? 0) + 1,
           writer: await this.state.deviceId(),
           updatedAt: new Date().toISOString(),
           doc: document,
         }
         try {
-          const written = await this.store.write(this.key, encodeEnvelope(envelope), remote === undefined
+          const written = await store.write(this.key, encodeEnvelope(next), remote === undefined
             ? { ifNoneMatch: true }
             : { ifMatch: remote.etag })
-          this.etag = written.etag
-          this.revision = envelope.rev
-          // The seam holds the section it was handed, runtime fields included;
-          // only storage is narrowed.
-          this.local = { ...document, [ns]: section }
-          await this.state.writeCache(OBJECT_NAME, envelope)
-          this.report(STATUS_LABEL, { lastWriteAt: envelope.updatedAt, lastError: undefined, state: 'idle' })
-          // Deferred: the seam commits this namespace only after persist
-          // returns, so publishing synchronously would emit the pre-write
-          // value first. By the time this runs, a later local write has also
-          // landed in `local`, so republishing it cannot resurrect a stale one.
-          setImmediate(() => {
-            if (!this.closed) this.publishDocument()
+          await this.saveBaseline(retrying({
+            ...agreed,
+            local: { ...agreed.local },
+            etag: written.etag,
+            rev: next.rev,
+            remote: aliasDocument(document),
+          }))
+          const uploaded = upload.map(([entry]) => entry)
+          this.owner.logger.info('dsh-oss-sync: uploaded %s as settings revision %d', uploaded.join(', '), next.rev)
+          this.report(STATUS_LABEL, {
+            state: failures.length === 0 ? 'idle' : 'error',
+            lastError: failures.length === 0 ? undefined : failures.join('; '),
+            revision: next.rev,
+            writer: next.writer,
+            updatedAt: next.updatedAt,
+            lastReadAt: readAt,
+            lastWriteAt: next.updatedAt,
+            uploaded,
+            applied: applied.length === 0 ? undefined : applied,
           })
           return
         } catch (error) {
           if (error instanceof PreconditionFailedError && attempt < MAX_WRITE_ATTEMPTS) continue
+          this.owner.logger.warn('dsh-oss-sync: could not write %s', this.key)
+          this.owner.logger.warn(error)
           this.report(STATUS_LABEL, { state: 'error', lastError: String(error) })
-          throw error
-        }
-      }
-    })
-  }
-
-  /**
-   * Commit one edit without storage, for the machine that has no bucket yet.
-   *
-   * The seam is what the page configures the connection through, so it has to
-   * work before a connection exists: the document stays in memory and in the
-   * cache, and the first bucket saved here seeds it to that location.
-   * @param ns - the namespace being written.
-   * @param section - the section as the seam holds it, runtime fields included.
-   * @param stored - the section narrowed to what storage would keep.
-   */
-  private commitLocally(
-    ns: SettingsNamespace, section: Record<string, unknown>, stored: Record<string, unknown>,
-  ): Promise<void> {
-    return this.enqueue(async () => {
-      const envelope: Envelope<SettingsDocument> = {
-        v: ENVELOPE_VERSION,
-        rev: this.revision + 1,
-        writer: await this.state.deviceId(),
-        updatedAt: new Date().toISOString(),
-        doc: { ...storedDocument(this.local), [ns]: stored },
-      }
-      this.revision = envelope.rev
-      this.local = { ...envelope.doc, [ns]: section }
-      await this.state.writeCache(OBJECT_NAME, envelope)
-      this.report(STATUS_LABEL, { state: 'idle', lastError: undefined })
-      setImmediate(() => {
-        if (!this.closed) this.publishDocument()
-      })
-    })
-  }
-
-  /**
-   * Put this machine's saved bucket credentials in force, before the first read.
-   *
-   * They are deliberately local: reading the document is what needs them, so
-   * they cannot live in it. A hand-edited half pair is ignored rather than
-   * fatal — the entry config still applies and the card can repair it.
-   */
-  private async adoptStoredConnection(): Promise<void> {
-    this.connection = await this.state.readConnection()
-    const merged = mergeConnection(this.bootstrap, this.connection)
-    if (sameConnection(merged, this.spec)) return
-    try {
-      const replacement = new ObjectStore(merged)
-      this.store.destroy()
-      this.store = replacement
-      this.spec = merged
-    } catch (error) {
-      this.ctx.logger.error('dsh-oss-sync: ignoring the bucket credentials saved on this machine')
-      this.ctx.logger.error(error)
-      this.connection = undefined
-    }
-  }
-
-  /** The composition layer the sync namespace resolves over. */
-  private baseLayer(): SyncSettings {
-    const { stateDir: _stateDir, ...base } = { ...this.bootstrap, ...this.connection }
-    return base
-  }
-
-  /**
-   * Keep this machine's copy of the bucket credentials in step with the page.
-   *
-   * A half-filled pair is left alone until the save is complete, so the store
-   * is never rebuilt around half a credential.
-   * @param section - the merged user section as the seam holds it.
-   */
-  private async syncStoredConnection(section: Record<string, unknown>): Promise<void> {
-    if (!('accessKeyId' in section) && !('secretAccessKey' in section)) return
-    const text = (field: string): string | undefined => {
-      const value = section[field]
-      return typeof value === 'string' && value.length > 0 ? value : undefined
-    }
-    const accessKeyId = text('accessKeyId')
-    const secretAccessKey = text('secretAccessKey')
-    if (accessKeyId === undefined && secretAccessKey === undefined) {
-      this.connection = undefined
-      await this.state.writeConnection()
-      return
-    }
-    if (accessKeyId === undefined || secretAccessKey === undefined) return
-    this.connection = { accessKeyId, secretAccessKey }
-    await this.state.writeConnection(this.connection)
-  }
-
-  override async* [Service.init](): AsyncGenerator<() => Promise<void> | void, void, void> {
-    // This machine's own copy of the bucket credentials is a bootstrap layer:
-    // the store needs them before the first read, which happens before any
-    // namespace resolves.
-    await this.adoptStoredConnection()
-    // A bucket this process cannot authenticate against is a status line, not
-    // a reason to refuse to boot: the cache still serves this machine, and the
-    // settings card reports the variables that are missing.
-    const preflightError = await this.preflight()
-    // The base init loads and publishes; an unreadable bucket has already
-    // fallen back to the cache there, so this cannot fail on an offline host.
-    yield* super[Service.init]()
-    this.scope = this.register(SYNC_NAMESPACE, SyncSettingsSchema, { base: this.baseLayer() })
-    this.ctx.provide('ossSyncControl', this.createControl())
-    await this.reconcileOrReport(this.scope.get())
-    this.scope.watch(next => this.onSettings(next))
-    this.report(STATUS_LABEL, {
-      state: preflightError === undefined ? 'idle' : 'error',
-      ...preflightError === undefined ? {} : { lastError: preflightError },
-      revision: this.revision,
-      writer: '',
-      updatedAt: '',
-      deviceId: await this.state.deviceId(),
-      objectKey: this.key,
-    })
-    this.applyPoll()
-    yield async () => {
-      this.closed = true
-      await this.poll.stop()
-      await this.operations
-      this.store.destroy()
-    }
-  }
-
-  /** The coordination handle the credentials provider joins. */
-  private createControl(): SyncControl {
-    return {
-      join: (label, participant) => {
-        this.participants.set(label, participant)
-        return () => { this.participants.delete(label) }
-      },
-      report: (label, patch) => { this.report(label, patch) },
-    }
-  }
-
-  /**
-   * React to a committed `oss-sync` section: run a requested sync, then adopt
-   * any connection parameter the user changed.
-   */
-  private async onSettings(next: SyncSettings): Promise<void> {
-    if (next.request !== undefined && next.request !== this.handled) {
-      this.handled = next.request
-      await this.runRequested(next.request)
-      return
-    }
-    await this.reconcileOrReport(next)
-  }
-
-  /**
-   * Report a bucket this process cannot use yet.
-   * @returns the failure's text, or `undefined` when storage preflight passed
-   *   (including the local-only start, which contacts nothing).
-   */
-  private async preflight(): Promise<string | undefined> {
-    try {
-      await this.store.preflight()
-      return undefined
-    } catch (error) {
-      this.ctx.logger.error('dsh-oss-sync: storage is not usable yet; serving this machine\'s cached document')
-      this.ctx.logger.error(error)
-      return String(error)
-    }
-  }
-
-  /**
-   * Adopt the settings the page resolved. A connection the page asked for may
-   * be unreachable or lack credentials; that is a status line the card shows,
-   * never a reason to take the host or the page down.
-   * @param next - the namespace value as the seam resolved it.
-   */
-  private async reconcileOrReport(next: SyncSettings): Promise<void> {
-    try {
-      await this.reconcile(next)
-    } catch (error) {
-      this.ctx.logger.error('dsh-oss-sync: could not apply the sync settings')
-      this.ctx.logger.error(error)
-      this.report(STATUS_LABEL, { state: 'error', lastError: String(error) })
-    }
-  }
-
-  /** Poll only while a bucket is configured; a cleared bucket suspends the loop. */
-  private applyPoll(): void {
-    if (this.spec.bucket.length === 0) this.poll.pause()
-    else this.poll.start()
-  }
-
-  /** Run the verb a card asked for on this provider and every participant. */
-  private async runRequested(request: string): Promise<void> {
-    const verb = requestVerb(request)
-    this.ctx.logger.info('dsh-oss-sync: %s requested from the settings page', verb)
-    const participants = [...this.participants.values()]
-    if (verb === 'push') {
-      await Promise.allSettled([this.push(), ...participants.map(participant => participant.push())])
-      return
-    }
-    await Promise.allSettled([this.refresh(), ...participants.map(participant => participant.refresh())])
-  }
-
-  /**
-   * Adopt the parameters the namespace now resolves to. A poll interval
-   * applies immediately; a changed connection or prefix moves the providers
-   * to the new location, carrying the document this process holds when the
-   * target is empty.
-   */
-  private async reconcile(next: SyncSettings): Promise<void> {
-    const desired = applyOverrides(this.bootstrap, next)
-    if (desired.pollMs !== this.spec.pollMs) this.poll.restart(desired.pollMs)
-    if (sameConnection(desired, this.spec) && desired.prefix === this.spec.prefix) {
-      this.spec = desired
-      this.applyPoll()
-      return
-    }
-    await this.relocate(desired)
-  }
-
-  /** Move both documents' home to the parameters the settings page asked for. */
-  private relocate(desired: ResolvedConfig): Promise<void> {
-    return this.enqueue(async () => {
-      const carried = storedDocument(this.local)
-      const connectionChanged = !sameConnection(desired, this.spec)
-      // Build the replacement before anything is swapped: a store that cannot
-      // be built must leave this provider on the connection it still serves.
-      const replacement = connectionChanged ? new ObjectStore(desired) : undefined
-      const target = replacement ?? this.store
-      const nextKey = objectKey(desired)
-      try {
-        if (!target.configured) {
-          // The page cleared the bucket: keep serving this machine's document
-          // and stop reaching for a service until one is set again.
-          this.adoptRelocation(desired, replacement, nextKey)
-          this.etag = undefined
-          this.applyPoll()
-          this.report(STATUS_LABEL, { state: 'idle', lastError: undefined })
           return
         }
-        // The target proves itself before it is adopted — the credential chain
-        // resolves, then the bucket answers a read — so a location this
-        // machine cannot reach leaves the working connection in place, and a
-        // later page save can still repair it.
-        if (replacement !== undefined) await replacement.preflight()
-        const remote = await target.read(nextKey)
-        if (remote === undefined) {
-          // The target starts from nothing: seed it from the document already
-          // in hand, so switching buckets or prefixes carries the
-          // configuration instead of appearing to lose it.
-          const envelope: Envelope<SettingsDocument> = {
-            v: ENVELOPE_VERSION,
-            rev: this.revision + 1,
-            writer: await this.state.deviceId(),
-            updatedAt: new Date().toISOString(),
-            doc: carried,
-          }
-          const written = await target.write(nextKey, encodeEnvelope(envelope), { ifNoneMatch: true })
-          this.adoptRelocation(desired, replacement, nextKey)
-          this.etag = written.etag
-          this.revision = envelope.rev
-          await this.state.writeCache(OBJECT_NAME, envelope)
-          this.local = this.withLocalFields(carried)
-          this.ctx.logger.info('dsh-oss-sync: moved to %s and seeded it from this machine', this.key)
-        } else {
-          const envelope = parseEnvelope<SettingsDocument>(remote.text)
-          this.adoptRelocation(desired, replacement, nextKey)
-          this.adopt(envelope, remote.etag)
-          await this.state.writeCache(OBJECT_NAME, envelope)
-          this.ctx.logger.info('dsh-oss-sync: moved to %s and adopted revision %d', this.key, envelope.rev)
-        }
-      } catch (error) {
-        replacement?.destroy()
-        this.report(STATUS_LABEL, { state: 'error', lastError: String(error), objectKey: nextKey })
-        throw error
       }
-      // A boot that started local-only left the loop paused; a move that just
-      // landed is exactly when polling must begin.
-      this.applyPoll()
-      this.publishDocument()
-      await this.follow()
     })
   }
 
-  /** Swap in a relocation target that has proven reachable, releasing the store it replaces. */
-  private adoptRelocation(desired: ResolvedConfig, replacement: ObjectStore | undefined, nextKey: string): void {
-    if (replacement !== undefined) {
-      this.store.destroy()
-      this.store = replacement
-    }
-    this.spec = desired
-    this.key = nextKey
-  }
+  // ── status ─────────────────────────────────────────────────────────────
 
   /**
-   * Move every participant to the location this provider just adopted.
-   *
-   * The credentials half follows the same namespace, and the seam offers no
-   * cross-namespace observer, so without this poke a connection saved on the
-   * page would reach the settings document now and the credential document
-   * only at the next poll — or never, while the local-only start has the poll
-   * suspended.
+   * Publish the status map into this entry's own volatile `status` reference,
+   * which `describe()` reads, and tell the page when something it shows moved.
+   * The reference is this process's alone: nothing here writes the profile.
    */
-  private async follow(): Promise<void> {
-    await Promise.allSettled([...this.participants.values()].map(participant => participant.refresh()))
-  }
-
-  /** Adopt one stored revision as this process's document. */
-  private adopt(envelope: Envelope<SettingsDocument>, etag: string): SettingsDocument {
-    this.etag = etag
-    this.revision = envelope.rev
-    this.local = this.withLocalFields(envelope.doc)
-    return this.local
-  }
-
-  /**
-   * Adopt a document that came from storage, keeping the fields that only ever
-   * live here.
-   *
-   * Storage never carries this machine's bucket credentials, so a poll that
-   * overwrote the seam with the stored document would erase the pair the page
-   * saved — and the next reconcile would then lose the connection with it.
-   * @param document - the document as stored.
-   * @returns the document the seam holds.
-   */
-  private withLocalFields(document: SettingsDocument): SettingsDocument {
-    const current = this.local[SYNC_NAMESPACE]
-    if (current === undefined) return document
-    const fields = Object.fromEntries(LOCAL_CREDENTIAL_FIELDS
-      .filter(field => current[field] !== undefined)
-      .map(field => [field, current[field]]))
-    if (Object.keys(fields).length === 0) return document
-    return { ...document, [SYNC_NAMESPACE]: { ...document[SYNC_NAMESPACE], ...fields } }
-  }
-
-  /** Publish the seam's document with the runtime status merged in. */
-  private publishDocument(): void {
-    // `configured` is a fact about the store in force, not about the last time
-    // a provider reported: the page saving a bucket must not keep showing the
-    // local-only line until the next poll. Only this provider's own label is
-    // stamped — the credentials half reports its own store, and a bucket saved
-    // here must not make its line claim a connection that half has not made.
-    const status = Object.fromEntries(Object.entries(this.status).map(([label, entry]) => (
-      [label, label === STATUS_LABEL ? { ...entry, configured: this.store.configured } : entry]
-    ))) as SyncStatusMap
-    const section = { ...(this.local[SYNC_NAMESPACE] ?? {}), status } as Record<string, unknown>
-    const document: SettingsDocument = { ...this.local, [SYNC_NAMESPACE]: section }
-    this.local = document
-    this.publish(document)
-  }
-
-  /** Merge one participant's status and republish the namespace. */
-  private report(label: string, patch: Partial<SyncStatus>): void {
-    const previous = this.status[label]
-    this.status[label] = {
-      state: 'idle',
-      configured: this.store.configured,
-      revision: this.revision,
-      writer: '',
-      updatedAt: '',
-      deviceId: previous?.deviceId ?? '',
-      objectKey: this.key,
-      ...previous,
-      ...patch,
+  private publishStatus(): void {
+    if (this.closed) return
+    const settingsStatus = this.status[STATUS_LABEL]
+    const map: SyncStatusMap = {
+      ...this.status,
+      ...settingsStatus === undefined ? {} : {
+        [STATUS_LABEL]: { ...settingsStatus, configured: this.configured, objectKey: this.key },
+      },
     }
-    if (!this.closed) this.publishDocument()
-  }
-
-  /**
-   * Re-commit this machine's document, which is what a `push` request asks
-   * for. The write keeps the same precondition as any other, so a remote that
-   * moved first wins and this machine reports the pull instead of erasing it.
-   */
-  private async push(): Promise<void> {
-    if (!this.store.configured) {
-      this.ctx.logger.info('dsh-oss-sync: no bucket configured; there is nowhere to push to yet')
-      return
-    }
-    const document = storedDocument(this.local)
-    await this.enqueue(async () => {
-      const remote = await this.store.read(this.key)
-      const envelope: Envelope<SettingsDocument> = {
-        v: ENVELOPE_VERSION,
-        rev: (remote === undefined ? this.revision : parseEnvelope<SettingsDocument>(remote.text).rev) + 1,
-        writer: await this.state.deviceId(),
-        updatedAt: new Date().toISOString(),
-        doc: document,
-      }
+    const snapshot = plainJson(map)
+    const reference: unknown = this.config.status
+    if (isVolatile(reference)) {
       try {
-        const written = await this.store.write(this.key, encodeEnvelope(envelope), remote === undefined
-          ? { ifNoneMatch: true }
-          : { ifMatch: remote.etag })
-        this.etag = written.etag
-        this.revision = envelope.rev
-        await this.state.writeCache(OBJECT_NAME, envelope)
-        this.report(STATUS_LABEL, { state: 'idle', revision: envelope.rev, lastWriteAt: envelope.updatedAt })
+        updateVolatile(reference, createVolatile(snapshot))
       } catch (error) {
-        if (!(error instanceof PreconditionFailedError)) throw error
-        this.ctx.logger.warn('dsh-oss-sync: %s moved while pushing; adopting the stored revision', this.key)
-        await this.refresh()
+        this.owner.logger.debug(error)
       }
-    })
+    }
+    // A read that found nothing new is not worth a page refresh.
+    const shown = JSON.stringify(Object.fromEntries(Object.entries(snapshot)
+      .map(([label, entry]) => [label, { ...entry, lastReadAt: undefined }])))
+    if (shown === this.announced) return
+    this.announced = shown
+    if (this.settings === undefined) return
+    try {
+      this.owner.emit('settings/document-updated', SYNC_ENTRY as never, 0)
+    } catch (error) {
+      this.owner.logger.debug(error)
+    }
   }
 
-  /** Read storage once and publish a revision this process did not commit. */
-  private refresh(): Promise<void> {
-    return this.enqueue(async () => {
-      if (this.closed) return
-      if (!this.store.configured) return
-      let remote
-      try {
-        remote = await this.store.read(this.key)
-      } catch (error) {
-        this.ctx.logger.warn('dsh-oss-sync: could not read %s; keeping the last good document', this.key)
-        this.ctx.logger.warn(error)
-        this.report(STATUS_LABEL, { state: 'error', lastError: String(error) })
-        return
-      }
-      this.report(STATUS_LABEL, { lastReadAt: new Date().toISOString(), lastError: undefined })
-      if (remote === undefined) return
-      if (this.etag !== undefined && remote.etag === this.etag) return
-      const envelope = parseEnvelope<SettingsDocument>(remote.text)
-      if (envelope.writer === await this.state.deviceId() && envelope.rev === this.revision) return
-      this.adopt(envelope, remote.etag)
-      await this.state.writeCache(OBJECT_NAME, envelope)
-      this.ctx.logger.info('dsh-oss-sync: applying settings revision %d from %s', envelope.rev, envelope.writer)
-      // The stored revision is newer, so it is authoritative for every
-      // namespace: a section it dropped stays dropped here.
-      this.report(STATUS_LABEL, { state: 'idle', updatedAt: envelope.updatedAt, writer: envelope.writer })
-    })
-  }
-
-  /** Set while the exclusive section runs, so a nested step joins it instead of queueing behind it. */
-  private exclusive = false
-
-  /** Queue one exclusive operation behind every earlier one. */
+  /**
+   * Queue one exclusive operation behind every earlier one. Nothing queued
+   * here queues again, so a poll can never interleave an apply or an upload.
+   */
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    // A step the running operation awaits — a refresh reconciling a connection
-    // change, whose move is itself exclusive — must run inline: queueing it
-    // would wait for the very operation that is waiting for it.
-    if (this.exclusive) return operation()
-    const task = this.operations.then(async () => {
-      this.exclusive = true
-      try {
-        return await operation()
-      } finally {
-        this.exclusive = false
-      }
-    })
+    const task = this.operations.then(operation)
     this.operations = task.then(() => undefined, () => undefined)
     return task
   }
 }
 
-export default OssSettingsProvider
+export default OssSettingsSync

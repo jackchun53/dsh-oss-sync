@@ -1,21 +1,21 @@
 /**
- * The revision envelope every synced object carries, plus the two pieces of
- * per-machine state a conditional writer needs: a stable device id, and a
- * cache of the last document read so an offline launch still starts from the
- * configuration this machine last saw.
+ * The revision envelope every synced object carries, plus the per-machine
+ * state a conditional writer needs: a stable device id, a cache of the last
+ * credential document read so an offline launch still starts from the keys
+ * this machine last saw, and each profile's settings-sync baseline.
  *
  * @module dsh-oss-sync/envelope
  */
 
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 
 /** Wire version this plugin writes and accepts; an unknown version is refused. */
 export const ENVELOPE_VERSION = 1
 
-/** File holding this machine's own bucket credentials, never synced. */
+/** File holding the machine-wide bucket credentials a 0.1.x install saved, never synced. */
 const CONNECTION_FILE = 'connection.yaml'
 
 /**
@@ -99,11 +99,11 @@ export class SyncState {
   constructor(private readonly dir: string) {}
 
   /**
-   * Read the connection credentials the settings page saved on this machine.
+   * Read the bucket credentials a 0.1.x settings page saved on this machine.
    *
-   * They are the one thing that cannot travel in the document: reading the
-   * document needs them. The file stays on this machine at mode 0600 and is
-   * never part of what syncs.
+   * 0.2.0 saves the pair in the profile instead; this file stays a read-only
+   * fallback beneath it, so an upgraded machine keeps reaching its bucket. The
+   * file stays on this machine at mode 0600 and is never part of what syncs.
    * @returns the stored pair, or `undefined` while this machine holds none.
    */
   async readConnection(): Promise<StoredConnection | undefined> {
@@ -129,7 +129,8 @@ export class SyncState {
   }
 
   /**
-   * Replace this machine's copy, or remove the file when the page cleared both.
+   * Replace the machine-wide pair, or remove the file when the page cleared
+   * the pair; 0.2.0 only ever removes it.
    * @param connection - the pair to store; omitting one, or both, is a clear.
    */
   async writeConnection(connection: StoredConnection = {}): Promise<void> {
@@ -214,6 +215,32 @@ export class SyncState {
   async writeCache<T>(name: string, envelope: Envelope<T>): Promise<void> {
     await mkdir(this.dir, { recursive: true })
     await writeFile(this.cachePath(name), encodeEnvelope(envelope), { encoding: 'utf8', mode: 0o600 })
+  }
+
+  /**
+   * Read one YAML state file this plugin wrote, such as a profile's sync
+   * baseline.
+   * @param relative - path below the state directory, `/`-separated.
+   * @returns the parsed value, or `undefined` when absent or unreadable.
+   */
+  async readState<T>(relative: string): Promise<T | undefined> {
+    try {
+      return parseYaml(await readFile(join(this.dir, ...relative.split('/')), 'utf8')) as T
+    } catch {
+      // Absence and a foreign file both mean "no state": the sync starts over.
+      return undefined
+    }
+  }
+
+  /**
+   * Replace one YAML state file.
+   * @param relative - path below the state directory, `/`-separated.
+   * @param value - the plain data to store.
+   */
+  async writeState(relative: string, value: unknown): Promise<void> {
+    const path = join(this.dir, ...relative.split('/'))
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, stringifyYaml(value, { lineWidth: 0 }), { encoding: 'utf8', mode: 0o600 })
   }
 
   /** Cache path for one object; the prefix is already part of the configured directory. */

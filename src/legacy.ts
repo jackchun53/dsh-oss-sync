@@ -1,10 +1,13 @@
 /**
- * One-time import of the file-backed stores this bundle replaces.
+ * One-time import of the file-backed credential store this bundle replaces.
  *
- * Installing the bundle disables `settings.yaml` and `.credentials.yaml`, but
- * those files remain on disk. A first boot must therefore seed the sync cache
- * from them instead of presenting an empty provider and making every model API
- * key appear to have vanished.
+ * Installing the bundle disables `.credentials.yaml`, but the file remains on
+ * disk. A first boot must therefore seed the credential cache from it instead
+ * of presenting an empty provider and making every model API key appear to
+ * have vanished.
+ *
+ * `$DSH_HOME/settings.yaml` is not read here any more: Harness 0.1.7 imports
+ * it into the active profile itself and renames it `settings.yaml.imported`.
  *
  * @module dsh-oss-sync/legacy
  */
@@ -14,9 +17,6 @@ import { join } from 'node:path'
 import type { CredentialRecord } from '@deepseek-ai/dsh-credentials'
 import { parseDocument } from 'yaml'
 import { resolveDshHome } from './config.js'
-
-/** Namespace-to-section document used by the file settings provider. */
-export type LegacySettingsDocument = Record<string, Record<string, unknown>>
 
 /** Reference and record maps used by the local credential provider. */
 export interface LegacyCredentialDocument {
@@ -50,26 +50,6 @@ function parseYaml(text: string, subject: string): unknown {
     throw new Error(`dsh-oss-sync: cannot import ${subject}: ${positions.join('; ')}`)
   }
   return document.toJS()
-}
-
-/**
- * Read the settings document the replaced file provider left behind.
- * @returns the document, or `undefined` when the file does not exist.
- */
-export async function readLegacySettings(): Promise<LegacySettingsDocument | undefined> {
-  const path = join(resolveDshHome(), 'settings.yaml')
-  const text = await readOptional(path)
-  if (text === undefined) return undefined
-  const root = parseYaml(text, path) ?? {}
-  if (!isMapping(root)) throw new Error(`dsh-oss-sync: cannot import ${path}: root must be a mapping`)
-  const document: LegacySettingsDocument = {}
-  for (const [namespace, section] of Object.entries(root)) {
-    if (!isMapping(section)) {
-      throw new Error(`dsh-oss-sync: cannot import ${path}: namespace "${namespace}" must be a mapping`)
-    }
-    document[namespace] = structuredClone(section)
-  }
-  return document
 }
 
 /** Admit one reference map without quoting any stored value. */
